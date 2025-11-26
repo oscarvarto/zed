@@ -31,19 +31,11 @@ pub(crate) fn extension_bump() -> Workflow {
         WorkflowSecret::new("app-secret", "The app secret for the corresponding app ID");
 
     let test_extension = extension_tests::check_extension();
-    let (check_bump_needed, needs_bump, current_version) = check_bump_needed();
-
-    let needs_bump = needs_bump.as_job_output(&check_bump_needed);
-    let current_version = current_version.as_job_output(&check_bump_needed);
-
-    let dependencies = [&test_extension, &check_bump_needed];
-
-    let bump_version =
-        bump_extension_version(&dependencies, &bump_type, &needs_bump, &app_id, &app_secret);
-    let create_label = create_version_label(
-        &dependencies,
-        &needs_bump,
-        &current_version,
+    let (check_bump_needed, needs_bump) = check_bump_needed();
+    let bump_version = bump_extension_version(
+        &[&test_extension, &check_bump_needed],
+        &bump_type,
+        needs_bump.as_job_output(&check_bump_needed),
         &app_id,
         &app_secret,
     );
@@ -73,74 +65,24 @@ pub(crate) fn extension_bump() -> Workflow {
         .add_job(test_extension.name, test_extension.job)
         .add_job(check_bump_needed.name, check_bump_needed.job)
         .add_job(bump_version.name, bump_version.job)
-        .add_job(create_label.name, create_label.job)
 }
 
-fn check_bump_needed() -> (NamedJob, StepOutput, StepOutput) {
-    let (compare_versions, version_changed, current_version) = compare_versions();
+fn check_bump_needed() -> (NamedJob, StepOutput) {
+    let (compare_versions, version_changed) = compare_versions();
 
     let job = Job::default()
         .with_repository_owner_guard()
-        .outputs([
-            (version_changed.name.to_owned(), version_changed.to_string()),
-            (
-                current_version.name.to_string(),
-                current_version.to_string(),
-            ),
-        ])
+        .outputs([(version_changed.name.to_owned(), version_changed.to_string())])
         .runs_on(runners::LINUX_SMALL)
         .timeout_minutes(1u32)
         .add_step(steps::checkout_repo().add_with(("fetch-depth", 10)))
         .add_step(compare_versions);
 
-    (named::job(job), version_changed, current_version)
-}
-
-fn create_version_label(
-    dependencies: &[&NamedJob],
-    needs_bump: &JobOutput,
-    current_version: &JobOutput,
-    app_id: &WorkflowSecret,
-    app_secret: &WorkflowSecret,
-) -> NamedJob {
-    let (generate_token, generated_token) = generate_token(app_id, app_secret);
-    let job = steps::dependant_job(dependencies)
-        .cond(Expression::new(format!(
-            "{DEFAULT_REPOSITORY_OWNER_GUARD} && {} == 'false'",
-            needs_bump.expr(),
-        )))
-        .runs_on(runners::LINUX_LARGE)
-        .timeout_minutes(1u32)
-        .add_step(generate_token)
-        .add_step(steps::checkout_repo())
-        .add_step(create_version_tag(current_version, generated_token));
-
-    named::job(job)
-}
-
-fn create_version_tag(current_version: &JobOutput, generated_token: StepOutput) -> Step<Use> {
-    named::uses("actions", "github-script", "v7").with(
-        Input::default()
-            .add(
-                "script",
-                format!(
-                    indoc! {r#"
-                        github.rest.git.createRef({{
-                            owner: context.repo.owner,
-                            repo: context.repo.repo,
-                            ref: 'refs/tags/v{}',
-                            sha: context.sha
-                        }})"#
-                    },
-                    current_version
-                ),
-            )
-            .add("github-token", generated_token.to_string()),
-    )
+    (named::job(job), version_changed)
 }
 
 /// Compares the current and previous commit and checks whether versions changed inbetween.
-fn compare_versions() -> (Step<Run>, StepOutput, StepOutput) {
+fn compare_versions() -> (Step<Run>, StepOutput) {
     let check_needs_bump = named::bash(format!(
         indoc! {
             r#"
@@ -154,7 +96,6 @@ fn compare_versions() -> (Step<Run>, StepOutput, StepOutput) {
           echo "needs_bump=true" >> "$GITHUB_OUTPUT" || \
           echo "needs_bump=false" >> "$GITHUB_OUTPUT"
 
-        echo "current_version=${{CURRENT_VERSION}}" >> "$GITHUB_OUTPUT"
         "#
         },
         VERSION_CHECK, VERSION_CHECK
@@ -162,15 +103,14 @@ fn compare_versions() -> (Step<Run>, StepOutput, StepOutput) {
     .id("compare-versions-check");
 
     let needs_bump = StepOutput::new(&check_needs_bump, "needs_bump");
-    let current_version = StepOutput::new(&check_needs_bump, "current_version");
 
-    (check_needs_bump, needs_bump, current_version)
+    (check_needs_bump, needs_bump)
 }
 
 fn bump_extension_version(
     dependencies: &[&NamedJob],
     bump_type: &WorkflowInput,
-    needs_bump: &JobOutput,
+    needs_bump: JobOutput,
     app_id: &WorkflowSecret,
     app_secret: &WorkflowSecret,
 ) -> NamedJob {
