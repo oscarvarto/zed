@@ -11570,7 +11570,7 @@ impl LspStore {
                         "Registering virtual document handler for scheme '{}' from extension",
                         config.scheme
                     );
-                    store.register_handler(config);
+                    store.register_handler(config).log_err();
                 }
             });
         }
