@@ -12299,12 +12299,10 @@ async fn test_virtual_buffer_registration_and_lookup(cx: &mut gpui::TestAppConte
         assert_eq!(found_buffer.unwrap().read(cx).remote_id(), buffer_id);
 
         // Verify it's tracked as a virtual buffer
-        let virtual_buffers = &project.buffer_store().read(cx).virtual_buffers;
-        assert!(virtual_buffers.contains_key(&buffer_id));
-        assert_eq!(
-            virtual_buffers.get(&buffer_id).unwrap().to_string(),
-            uri_string
-        );
+        let buffer_store = project.buffer_store().read(cx);
+        let virtual_uri = buffer_store.virtual_buffer_uri(buffer_id);
+        assert!(virtual_uri.is_some());
+        assert_eq!(virtual_uri.unwrap().to_string(), uri_string);
     });
 }
 
@@ -12419,7 +12417,7 @@ async fn test_multiple_virtual_buffers(cx: &mut gpui::TestAppContext) {
         }
 
         // Verify count
-        assert_eq!(project.buffer_store().read(cx).virtual_buffers.len(), 3);
+        assert_eq!(project.buffer_store().read(cx).virtual_buffers_len(), 3);
     });
 }
 
@@ -12593,7 +12591,7 @@ async fn test_multiple_language_virtual_buffers(cx: &mut gpui::TestAppContext) {
     // Verify all virtual buffers are registered
     project.read_with(cx, |project, cx| {
         let buffer_store = project.buffer_store().read(cx);
-        assert_eq!(buffer_store.virtual_buffers.len(), 3);
+        assert_eq!(buffer_store.virtual_buffers_len(), 3);
 
         for (uri_str, expected_content) in &virtual_docs {
             let buffer = buffer_store.get_buffer_by_uri(uri_str);
@@ -12915,7 +12913,7 @@ async fn test_multiple_typescript_virtual_declarations(cx: &mut gpui::TestAppCon
     // Verify all virtual buffers are registered and accessible
     project.read_with(cx, |project, cx| {
         let buffer_store = project.buffer_store().read(cx);
-        assert_eq!(buffer_store.virtual_buffers.len(), 4);
+        assert_eq!(buffer_store.virtual_buffers_len(), 4);
 
         for (uri_str, expected_content) in &virtual_dts_files {
             let buffer = buffer_store.get_buffer_by_uri(uri_str);
@@ -13350,7 +13348,7 @@ async fn test_multiple_debugger_virtual_sources(cx: &mut gpui::TestAppContext) {
     // Verify all virtual buffers are registered
     project.read_with(cx, |project, cx| {
         let buffer_store = project.buffer_store().read(cx);
-        assert_eq!(buffer_store.virtual_buffers.len(), 4);
+        assert_eq!(buffer_store.virtual_buffers_len(), 4);
 
         for (uri_str, expected_content) in &virtual_debug_sources {
             let buffer = buffer_store.get_buffer_by_uri(uri_str);
@@ -13639,7 +13637,7 @@ async fn test_deno_multiple_virtual_documents(cx: &mut gpui::TestAppContext) {
     // Verify all Deno virtual documents are accessible
     project.read_with(cx, |project, cx| {
         let buffer_store = project.buffer_store().read(cx);
-        assert_eq!(buffer_store.virtual_buffers.len(), 4);
+        assert_eq!(buffer_store.virtual_buffers_len(), 4);
 
         for (uri_str, expected_content) in &deno_virtual_docs {
             let buffer = buffer_store.get_buffer_by_uri(uri_str);
