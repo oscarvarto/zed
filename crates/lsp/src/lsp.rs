@@ -1428,25 +1428,23 @@ impl LanguageServer {
     {
         let executor = executor.clone();
         Box::new(move |result| {
-            executor
-                .spawn(async move {
-                    let response = match result {
-                        Ok(response) => match serde_json::from_str(&response) {
-                            Ok(deserialized) => Ok(deserialized),
-                            Err(error) => {
-                                log::error!(
-                                    "failed to deserialize response: {}. response: {:?}",
-                                    error,
-                                    response
-                                );
-                                Err(error).context("failed to deserialize response")
-                            }
-                        },
-                        Err(error) => Err(anyhow!("{}", error.message)),
-                    };
-                    _ = tx.send(response);
-                })
-                .detach();
+            executor.spawn(async move {
+                let response = match result {
+                    Ok(response) => match serde_json::from_str(&response) {
+                        Ok(deserialized) => Ok(deserialized),
+                        Err(error) => {
+                            log::error!(
+                                "failed to deserialize response: {}. response: {:?}",
+                                error,
+                                response
+                            );
+                            Err(error).context("failed to deserialize response")
+                        }
+                    },
+                    Err(error) => Err(anyhow!("{}", error.message)),
+                };
+                _ = tx.send(response);
+            })
         })
     }
 
@@ -1507,7 +1505,7 @@ impl LanguageServer {
                     }
                 }
 
-                _ = self.executor.timer(LSP_REQUEST_TIMEOUT).fuse() => {
+                _ = self.executor.timer(DEFAULT_LSP_REQUEST_TIMEOUT).fuse() => {
                     log::error!("Request {method:?} id {id} timed out");
                     ConnectionResult::Timeout
                 }
