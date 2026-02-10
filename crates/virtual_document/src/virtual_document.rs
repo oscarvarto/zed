@@ -1,12 +1,11 @@
 use anyhow::{Context as _, Result};
 use collections::HashMap;
 use gpui::{App, BackgroundExecutor, Task};
-use lsp::{LanguageServer, Position, TextDocumentIdentifier, TextDocumentPositionParams};
-use serde_json::Value;
+use lsp::{LanguageServer, Position};
 use std::sync::Arc;
 
 // Re-export the config types from lsp crate (defined there to avoid circular dependencies)
-pub use lsp::{VirtualDocumentConfig, VirtualDocumentParamKind};
+pub use lsp::{VirtualDocumentConfig, VirtualDocumentParamBuilder};
 
 /// Schemes reserved by the system that cannot be registered for virtual documents.
 const RESERVED_SCHEMES: &[&str] = &["file", "http", "https", "ssh", "untitled"];
@@ -83,7 +82,6 @@ impl VirtualDocumentStore {
 
     /// Fetches virtual document content via the language server.
     /// Returns `None` if no handler is registered for the URI's scheme.
-    /// For `UriWithPosition` param kind, falls back to position (0, 0) if not provided.
     pub fn process_uri(
         &self,
         uri: &lsp::Uri,
@@ -96,24 +94,8 @@ impl VirtualDocumentStore {
         let request_method = config.content_request_method.clone();
         let executor = self.executor.clone();
 
-        let params: Value = match &config.param_kind {
-            VirtualDocumentParamKind::Uri => {
-                serde_json::to_value(TextDocumentIdentifier { uri: uri.clone() })
-                    .expect("TextDocumentIdentifier should serialize")
-            }
-            VirtualDocumentParamKind::RawUri => Value::String(uri.to_string()),
-            VirtualDocumentParamKind::UriWithPosition => {
-                let pos = position.unwrap_or(Position {
-                    line: 0,
-                    character: 0,
-                });
-                serde_json::to_value(TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: uri.clone() },
-                    position: pos,
-                })
-                .expect("TextDocumentPositionParams should serialize")
-            }
-        };
+        // Use the builder callback to construct request parameters
+        let params = config.param_builder.build_params(uri, position);
 
         Some(executor.spawn(async move {
             language_server
@@ -135,13 +117,12 @@ mod tests {
     use std::str::FromStr;
 
     fn make_config(scheme: &str) -> VirtualDocumentConfig {
-        VirtualDocumentConfig {
-            scheme: scheme.to_string(),
-            content_request_method: format!("{}/getContents", scheme),
-            language_name: "TestLanguage".to_string(),
-            language_id: "test".to_string(),
-            param_kind: VirtualDocumentParamKind::default(),
-        }
+        VirtualDocumentConfig::new(
+            scheme,
+            format!("{}/getContents", scheme),
+            "TestLanguage",
+            "test",
+        )
     }
 
     #[gpui::test]
@@ -201,13 +182,8 @@ mod tests {
         cx.update(|cx| {
             let mut store = VirtualDocumentStore::new(cx);
 
-            let config1 = VirtualDocumentConfig {
-                scheme: "jdt".to_string(),
-                content_request_method: "java/classFileContents".to_string(),
-                language_name: "Java".to_string(),
-                language_id: "java".to_string(),
-                param_kind: VirtualDocumentParamKind::default(),
-            };
+            let config1 =
+                VirtualDocumentConfig::new("jdt", "java/classFileContents", "Java", "java");
             store.register_handler(config1).unwrap();
 
             assert_eq!(
@@ -218,13 +194,7 @@ mod tests {
                 "java/classFileContents"
             );
 
-            let config2 = VirtualDocumentConfig {
-                scheme: "jdt".to_string(),
-                content_request_method: "java/newMethod".to_string(),
-                language_name: "Java".to_string(),
-                language_id: "java".to_string(),
-                param_kind: VirtualDocumentParamKind::default(),
-            };
+            let config2 = VirtualDocumentConfig::new("jdt", "java/newMethod", "Java", "java");
             store.register_handler(config2).unwrap();
 
             assert_eq!(store.handlers().len(), 1);
@@ -270,80 +240,74 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_param_kind_variants(cx: &mut gpui::TestAppContext) {
+    fn test_param_builder_variants(cx: &mut gpui::TestAppContext) {
+        use std::str::FromStr;
+
         cx.update(|cx| {
             let mut store = VirtualDocumentStore::new(cx);
 
-            let jdt_config = VirtualDocumentConfig {
-                scheme: "jdt".to_string(),
-                content_request_method: "java/classFileContents".to_string(),
-                language_name: "Java".to_string(),
-                language_id: "java".to_string(),
-                param_kind: VirtualDocumentParamKind::Uri,
-            };
+            // Test UriParamBuilder (default)
+            let jdt_config =
+                VirtualDocumentConfig::new("jdt", "java/classFileContents", "Java", "java");
             store.register_handler(jdt_config).unwrap();
-            assert_eq!(
-                store.handler_for_scheme("jdt").unwrap().param_kind,
-                VirtualDocumentParamKind::Uri
-            );
 
-            let raw_config = VirtualDocumentConfig {
-                scheme: "custom".to_string(),
-                content_request_method: "custom/getContents".to_string(),
-                language_name: "Custom".to_string(),
-                language_id: "custom".to_string(),
-                param_kind: VirtualDocumentParamKind::RawUri,
-            };
+            // Test RawUriParamBuilder
+            let raw_config = VirtualDocumentConfig::with_raw_uri(
+                "custom",
+                "custom/getContents",
+                "Custom",
+                "custom",
+            );
             store.register_handler(raw_config).unwrap();
-            assert_eq!(
-                store.handler_for_scheme("custom").unwrap().param_kind,
-                VirtualDocumentParamKind::RawUri
-            );
 
-            let ra_config = VirtualDocumentConfig {
-                scheme: "rust-analyzer".to_string(),
-                content_request_method: "rust-analyzer/expandMacro".to_string(),
-                language_name: "Rust".to_string(),
-                language_id: "rust".to_string(),
-                param_kind: VirtualDocumentParamKind::UriWithPosition,
-            };
+            // Test UriWithPositionParamBuilder
+            let ra_config = VirtualDocumentConfig::with_position(
+                "rust-analyzer",
+                "rust-analyzer/expandMacro",
+                "Rust",
+                "rust",
+            );
             store.register_handler(ra_config).unwrap();
-            assert_eq!(
-                store
-                    .handler_for_scheme("rust-analyzer")
-                    .unwrap()
-                    .param_kind,
-                VirtualDocumentParamKind::UriWithPosition
-            );
 
+            // Verify all handlers are registered
             assert_eq!(store.handlers().len(), 3);
+            assert!(store.handler_for_scheme("jdt").is_some());
+            assert!(store.handler_for_scheme("custom").is_some());
+            assert!(store.handler_for_scheme("rust-analyzer").is_some());
+
+            // Test that builders produce correct output
+            let test_uri = lsp::Uri::from_str("jdt://test").unwrap();
+            let jdt_builder = &store.handler_for_scheme("jdt").unwrap().param_builder;
+            let params = jdt_builder.build_params(&test_uri, None);
+            assert_eq!(params["uri"], "jdt://test");
+
+            let custom_builder = &store.handler_for_scheme("custom").unwrap().param_builder;
+            let params = custom_builder.build_params(&test_uri, None);
+            assert_eq!(params, "jdt://test");
         });
     }
 
     #[gpui::test]
-    fn test_default_param_kind(cx: &mut gpui::TestAppContext) {
+    fn test_default_param_builder(cx: &mut gpui::TestAppContext) {
+        use std::str::FromStr;
+
         cx.update(|cx| {
             let mut store = VirtualDocumentStore::new(cx);
 
             let config = make_config("test");
             store.register_handler(config).unwrap();
 
-            assert_eq!(
-                store.handler_for_scheme("test").unwrap().param_kind,
-                VirtualDocumentParamKind::Uri
-            );
+            // Verify default builder is UriParamBuilder
+            let test_uri = lsp::Uri::from_str("test://file").unwrap();
+            let builder = &store.handler_for_scheme("test").unwrap().param_builder;
+            let params = builder.build_params(&test_uri, None);
+            assert_eq!(params["uri"], "test://file");
         });
     }
 
     #[test]
     fn test_display_name_from_uri_java_class() {
-        let config = VirtualDocumentConfig {
-            scheme: "jdt".to_string(),
-            content_request_method: "java/classFileContents".to_string(),
-            language_name: "Java".to_string(),
-            language_id: "java".to_string(),
-            param_kind: VirtualDocumentParamKind::Uri,
-        };
+        let config = VirtualDocumentConfig::new("jdt", "java/classFileContents", "Java", "java");
 
         let uri = lsp::Uri::from_str("jdt://contents/rt.jar/java.util/ArrayList.class").unwrap();
         assert_eq!(display_name_from_uri(&uri, &config), "ArrayList.java");
