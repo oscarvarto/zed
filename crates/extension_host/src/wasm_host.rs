@@ -229,25 +229,28 @@ impl extension::Extension for WasmExtension {
                 // Convert from WIT types to extension types
                 let converted = configs
                     .into_iter()
-                    .map(|wit_config| extension::VirtualDocumentConfig {
-                        scheme: wit_config.scheme,
-                        content_request_method: wit_config.content_request_method,
-                        language_name: wit_config.language_name,
-                        language_id: wit_config.language_id,
-                        param_kind: wit_config
-                            .param_kind
-                            .map(|kind| match kind {
-                                wit::VirtualDocumentParamKind::Uri => {
-                                    lsp::VirtualDocumentParamKind::Uri
+                    .map(|wit_config| {
+                        // Create the appropriate builder based on the WIT param_kind
+                        let builder: Arc<dyn lsp::VirtualDocumentParamBuilder> =
+                            match wit_config.param_kind {
+                                Some(wit::VirtualDocumentParamKind::Uri) | None => {
+                                    Arc::new(lsp::UriParamBuilder)
                                 }
-                                wit::VirtualDocumentParamKind::RawUri => {
-                                    lsp::VirtualDocumentParamKind::RawUri
+                                Some(wit::VirtualDocumentParamKind::RawUri) => {
+                                    Arc::new(lsp::RawUriParamBuilder)
                                 }
-                                wit::VirtualDocumentParamKind::UriWithPosition => {
-                                    lsp::VirtualDocumentParamKind::UriWithPosition
+                                Some(wit::VirtualDocumentParamKind::UriWithPosition) => {
+                                    Arc::new(lsp::UriWithPositionParamBuilder)
                                 }
-                            })
-                            .unwrap_or_default(),
+                            };
+
+                        extension::VirtualDocumentConfig {
+                            scheme: wit_config.scheme,
+                            content_request_method: wit_config.content_request_method,
+                            language_name: wit_config.language_name,
+                            language_id: wit_config.language_id,
+                            param_builder: builder,
+                        }
                     })
                     .collect();
                 anyhow::Ok(converted)
