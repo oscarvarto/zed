@@ -13136,13 +13136,12 @@ async fn test_rust_analyzer_virtual_document_store_config(cx: &mut gpui::TestApp
 
         // Register rust-analyzer config with UriWithPosition param kind
         // This is the typical configuration for rust-analyzer virtual documents
-        let ra_config = lsp::VirtualDocumentConfig {
-            scheme: "rust-analyzer".to_string(),
-            content_request_method: "rust-analyzer/viewFileText".to_string(),
-            language_name: "Rust".to_string(),
-            language_id: "rust".to_string(),
-            param_kind: lsp::VirtualDocumentParamKind::UriWithPosition,
-        };
+        let ra_config = lsp::VirtualDocumentConfig::with_position(
+            "rust-analyzer",
+            "rust-analyzer/viewFileText",
+            "Rust",
+            "rust",
+        );
         store.register_handler(ra_config).unwrap();
 
         // Verify the handler is registered
@@ -13153,10 +13152,15 @@ async fn test_rust_analyzer_virtual_document_store_config(cx: &mut gpui::TestApp
         assert_eq!(handler.scheme, "rust-analyzer");
         assert_eq!(handler.language_name, "Rust");
         assert_eq!(handler.language_id, "rust");
-        assert_eq!(
-            handler.param_kind,
-            lsp::VirtualDocumentParamKind::UriWithPosition
-        );
+
+        // Test that the builder produces the correct output
+        let test_uri = lsp::Uri::from_str("rust-analyzer://test").unwrap();
+        let params = handler
+            .param_builder
+            .build_params(&test_uri, Some(lsp::Position::new(5, 10)));
+        assert_eq!(params["textDocument"]["uri"], "rust-analyzer://test");
+        assert_eq!(params["position"]["line"], 5);
+        assert_eq!(params["position"]["character"], 10);
     });
 }
 
@@ -13164,13 +13168,12 @@ async fn test_rust_analyzer_virtual_document_store_config(cx: &mut gpui::TestApp
 async fn test_rust_analyzer_display_name_extraction(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
-    let config = lsp::VirtualDocumentConfig {
-        scheme: "rust-analyzer".to_string(),
-        content_request_method: "rust-analyzer/viewFileText".to_string(),
-        language_name: "Rust".to_string(),
-        language_id: "rust".to_string(),
-        param_kind: lsp::VirtualDocumentParamKind::UriWithPosition,
-    };
+    let config = lsp::VirtualDocumentConfig::with_position(
+        "rust-analyzer",
+        "rust-analyzer/viewFileText",
+        "Rust",
+        "rust",
+    );
 
     // Test macro expansion URI
     let macro_uri =
@@ -13338,13 +13341,12 @@ async fn test_typescript_virtual_document_store_config(cx: &mut gpui::TestAppCon
         let mut store = virtual_document::VirtualDocumentStore::new(cx);
 
         // Register TypeScript config for generated declaration files
-        let ts_config = lsp::VirtualDocumentConfig {
-            scheme: "ts-server".to_string(),
-            content_request_method: "typescript/virtualDocumentContent".to_string(),
-            language_name: "TypeScript".to_string(),
-            language_id: "typescript".to_string(),
-            param_kind: lsp::VirtualDocumentParamKind::Uri,
-        };
+        let ts_config = lsp::VirtualDocumentConfig::new(
+            "ts-server",
+            "typescript/virtualDocumentContent",
+            "TypeScript",
+            "typescript",
+        );
         store.register_handler(ts_config).unwrap();
 
         // Verify the handler is registered
@@ -13355,7 +13357,11 @@ async fn test_typescript_virtual_document_store_config(cx: &mut gpui::TestAppCon
         assert_eq!(handler.scheme, "ts-server");
         assert_eq!(handler.language_name, "TypeScript");
         assert_eq!(handler.language_id, "typescript");
-        assert_eq!(handler.param_kind, lsp::VirtualDocumentParamKind::Uri);
+
+        // Test that the builder produces the correct output
+        let test_uri = lsp::Uri::from_str("ts-server://test").unwrap();
+        let params = handler.param_builder.build_params(&test_uri, None);
+        assert_eq!(params["uri"], "ts-server://test");
     });
 }
 
@@ -13363,13 +13369,12 @@ async fn test_typescript_virtual_document_store_config(cx: &mut gpui::TestAppCon
 async fn test_typescript_display_name_extraction(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
-    let config = lsp::VirtualDocumentConfig {
-        scheme: "ts-server".to_string(),
-        content_request_method: "typescript/virtualDocumentContent".to_string(),
-        language_name: "TypeScript".to_string(),
-        language_id: "typescript".to_string(),
-        param_kind: lsp::VirtualDocumentParamKind::Uri,
-    };
+    let config = lsp::VirtualDocumentConfig::new(
+        "ts-server",
+        "typescript/virtualDocumentContent",
+        "TypeScript",
+        "typescript",
+    );
 
     // Test .d.ts file URI
     let dts_uri =
@@ -13665,13 +13670,8 @@ async fn test_dap_virtual_document_store_config(cx: &mut gpui::TestAppContext) {
         let mut store = virtual_document::VirtualDocumentStore::new(cx);
 
         // Register DAP browser config for Go debugging
-        let dap_go_config = lsp::VirtualDocumentConfig {
-            scheme: "dap-browser".to_string(),
-            content_request_method: "dap/source".to_string(),
-            language_name: "Go".to_string(),
-            language_id: "go".to_string(),
-            param_kind: lsp::VirtualDocumentParamKind::Uri,
-        };
+        let dap_go_config =
+            lsp::VirtualDocumentConfig::new("dap-browser", "dap/source", "Go", "go");
         store.register_handler(dap_go_config).unwrap();
 
         // Verify the handler is registered
@@ -13689,13 +13689,7 @@ async fn test_dap_virtual_document_store_config(cx: &mut gpui::TestAppContext) {
 async fn test_dap_display_name_extraction(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
-    let config = lsp::VirtualDocumentConfig {
-        scheme: "dap-browser".to_string(),
-        content_request_method: "dap/source".to_string(),
-        language_name: "Go".to_string(),
-        language_id: "go".to_string(),
-        param_kind: lsp::VirtualDocumentParamKind::Uri,
-    };
+    let config = lsp::VirtualDocumentConfig::new("dap-browser", "dap/source", "Go", "go");
 
     // Test Go runtime source URI
     let runtime_uri = lsp::Uri::from_str("dap-browser://go-runtime/src/runtime/proc.go").unwrap();
@@ -14058,13 +14052,7 @@ func generatedFunction() {
         assert!(found.is_some());
 
         // Test display name extraction handles query params
-        let config = lsp::VirtualDocumentConfig {
-            scheme: "dap-browser".to_string(),
-            content_request_method: "dap/source".to_string(),
-            language_name: "Go".to_string(),
-            language_id: "go".to_string(),
-            param_kind: lsp::VirtualDocumentParamKind::Uri,
-        };
+        let config = lsp::VirtualDocumentConfig::new("dap-browser", "dap/source", "Go", "go");
         let display_name = virtual_document::display_name_from_uri(&uri, &config);
         // Should extract "12345" as it's the last path segment before the query
         assert_eq!(display_name, "12345");
@@ -14182,13 +14170,12 @@ async fn test_deno_virtual_document_store_config(cx: &mut gpui::TestAppContext) 
         let mut store = virtual_document::VirtualDocumentStore::new(cx);
 
         // This is how a Deno extension would register its virtual document handler
-        let deno_config = lsp::VirtualDocumentConfig {
-            scheme: "deno".to_string(),
-            content_request_method: "deno/virtualTextDocument".to_string(),
-            language_name: "TypeScript".to_string(),
-            language_id: "typescript".to_string(),
-            param_kind: lsp::VirtualDocumentParamKind::Uri,
-        };
+        let deno_config = lsp::VirtualDocumentConfig::new(
+            "deno",
+            "deno/virtualTextDocument",
+            "TypeScript",
+            "typescript",
+        );
         store.register_handler(deno_config).unwrap();
 
         // Verify the handler is registered
@@ -14207,13 +14194,12 @@ async fn test_deno_virtual_document_store_config(cx: &mut gpui::TestAppContext) 
 async fn test_deno_display_name_extraction(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 
-    let config = lsp::VirtualDocumentConfig {
-        scheme: "deno".to_string(),
-        content_request_method: "deno/virtualTextDocument".to_string(),
-        language_name: "TypeScript".to_string(),
-        language_id: "typescript".to_string(),
-        param_kind: lsp::VirtualDocumentParamKind::Uri,
-    };
+    let config = lsp::VirtualDocumentConfig::new(
+        "deno",
+        "deno/virtualTextDocument",
+        "TypeScript",
+        "typescript",
+    );
 
     // Test Deno namespace types
     let ns_uri = lsp::Uri::from_str("deno:/asset/lib.deno.ns.d.ts").unwrap();
