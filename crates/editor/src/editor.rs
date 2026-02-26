@@ -11476,11 +11476,15 @@ impl Editor {
                 // Cursor with no selection: scan for table boundaries
                 let cursor_row = selection.start.row;
                 if !Self::looks_like_table_row(
-                    &buffer.text_for_range(
-                        Point::new(cursor_row, 0)
-                            ..Point::new(cursor_row, buffer.line_len(MultiBufferRow(cursor_row))),
-                    )
-                    .collect::<String>(),
+                    &buffer
+                        .text_for_range(
+                            Point::new(cursor_row, 0)
+                                ..Point::new(
+                                    cursor_row,
+                                    buffer.line_len(MultiBufferRow(cursor_row)),
+                                ),
+                        )
+                        .collect::<String>(),
                 ) {
                     continue;
                 }
@@ -11521,8 +11525,7 @@ impl Editor {
             };
 
             let start_point = Point::new(start_row, 0);
-            let end_point =
-                Point::new(end_row, buffer.line_len(MultiBufferRow(end_row)));
+            let end_point = Point::new(end_row, buffer.line_len(MultiBufferRow(end_row)));
 
             // Skip if this range overlaps with an already-collected edit
             if edits
