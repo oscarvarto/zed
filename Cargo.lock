@@ -10163,6 +10163,7 @@ dependencies = [
  "sum_tree",
  "theme",
  "ui",
+ "unicode-width",
  "util",
 ]
 
