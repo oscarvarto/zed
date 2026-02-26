@@ -89,12 +89,8 @@ fn parse_row(line: &str) -> Vec<String> {
     let trimmed = line.trim();
 
     // Strip leading and trailing pipes
-    let inner = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed);
-    let inner = inner
-        .strip_suffix('|')
-        .unwrap_or(inner);
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
 
     split_on_unescaped_pipe(inner)
         .iter()
@@ -276,7 +272,10 @@ mod tests {
         let input = "| A | B | C |\n| --- | --- | --- |\n| 1 | 2 |\n| x | y | z |";
         let result = format_markdown_table(input).unwrap();
         // Row with 2 cells should get an empty third column padded to min width
-        assert!(result.contains("|     |"), "expected empty padded cell, got:\n{result}");
+        assert!(
+            result.contains("|     |"),
+            "expected empty padded cell, got:\n{result}"
+        );
     }
 
     #[test]

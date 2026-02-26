@@ -1,6 +1,6 @@
 pub mod parser;
-pub mod table_format;
 mod path_range;
+pub mod table_format;
 
 use base64::Engine as _;
 use futures::FutureExt as _;
