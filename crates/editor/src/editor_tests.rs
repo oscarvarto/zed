@@ -6069,9 +6069,7 @@ async fn test_format_markdown_table_cursor_in_table(cx: &mut TestAppContext) {
         | Alice | 30 | New Yorkˇ |
         | Bob | 25 | LA |
     "});
-    cx.update_editor(|e, window, cx| {
-        e.format_markdown_table(&FormatMarkdownTable, window, cx)
-    });
+    cx.update_editor(|e, window, cx| e.format_markdown_table(&FormatMarkdownTable, window, cx));
     cx.assert_editor_state(indoc! {"
         | Name  | Age | City     |
         | ----- | --- | -------- |
@@ -6093,9 +6091,7 @@ async fn test_format_markdown_table_with_selection(cx: &mut TestAppContext) {
         | --- | --- |
         | hello | world |ˇ»
     "});
-    cx.update_editor(|e, window, cx| {
-        e.format_markdown_table(&FormatMarkdownTable, window, cx)
-    });
+    cx.update_editor(|e, window, cx| e.format_markdown_table(&FormatMarkdownTable, window, cx));
     cx.assert_editor_state(indoc! {"
         | A     | B     |
         | ----- | ----- |
@@ -6113,9 +6109,7 @@ async fn test_format_markdown_table_cursor_not_in_table(cx: &mut TestAppContext)
     cx.set_state(indoc! {"
         This is just textˇ
     "});
-    cx.update_editor(|e, window, cx| {
-        e.format_markdown_table(&FormatMarkdownTable, window, cx)
-    });
+    cx.update_editor(|e, window, cx| e.format_markdown_table(&FormatMarkdownTable, window, cx));
     cx.assert_editor_state(indoc! {"
         This is just textˇ
     "});
