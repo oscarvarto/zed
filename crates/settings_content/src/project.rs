@@ -9,8 +9,9 @@ use settings_macros::{MergeFrom, with_fallible_options};
 use util::serde::default_true;
 
 use crate::{
-    AllLanguageSettingsContent, DelayMs, ExtendingVec, ParseStatus, ProjectTerminalSettingsContent,
-    RootUserSettings, SaturatingBool, SlashCommandSettings, fallible_options,
+    AllLanguageSettingsContent, DelayMs, EnvValue, ExtendingVec, ParseStatus,
+    ProjectTerminalSettingsContent, RootUserSettings, SaturatingBool, SlashCommandSettings,
+    fallible_options,
 };
 
 #[with_fallible_options]
@@ -356,9 +357,9 @@ pub enum ContextServerSettingsContent {
         enabled: bool,
         /// The URL of the remote context server.
         url: String,
-        /// Optional headers to send.
+        /// Optional headers to send. Values can be plain strings or secret references.
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-        headers: HashMap<String, String>,
+        headers: HashMap<String, EnvValue>,
         /// Timeout for tool calls in seconds. Defaults to global context_server_timeout if not specified.
         timeout: Option<u64>,
     },
@@ -408,7 +409,9 @@ pub struct ContextServerCommand {
     #[serde(rename = "command")]
     pub path: PathBuf,
     pub args: Vec<String>,
-    pub env: Option<HashMap<String, String>>,
+    /// Environment variables for the context server process.
+    /// Values can be plain strings or secret references.
+    pub env: Option<HashMap<String, EnvValue>>,
     /// Timeout for tool calls in seconds. Defaults to 60 if not specified.
     pub timeout: Option<u64>,
 }
@@ -418,14 +421,17 @@ impl std::fmt::Debug for ContextServerCommand {
         let filtered_env = self.env.as_ref().map(|env| {
             env.iter()
                 .map(|(k, v)| {
-                    (
-                        k,
-                        if util::redact::should_redact(k) {
-                            "[REDACTED]"
-                        } else {
-                            v
-                        },
-                    )
+                    let display_value: &dyn std::fmt::Debug = match v {
+                        EnvValue::Secret { .. } => &"[SECRET]",
+                        EnvValue::Plain(s) => {
+                            if util::redact::should_redact(k) {
+                                &"[REDACTED]"
+                            } else {
+                                s
+                            }
+                        }
+                    };
+                    (k, display_value)
                 })
                 .collect::<Vec<_>>()
         });

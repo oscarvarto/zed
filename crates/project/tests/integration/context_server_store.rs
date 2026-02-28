@@ -6,13 +6,14 @@ use http_client::{FakeHttpClient, Response};
 use project::context_server_store::registry::ContextServerDescriptorRegistry;
 use project::context_server_store::*;
 use project::project_settings::ContextServerSettings;
+use project::secret_resolver::SecretResolver;
 use project::worktree_store::WorktreeStore;
 use project::{
     FakeFs, Project, context_server_store::registry::ContextServerDescriptor,
     project_settings::ProjectSettings,
 };
 use serde_json::json;
-use settings::{ContextServerCommand, Settings, SettingsStore};
+use settings::{ContextServerCommand, EnvValue, SecretReference, Settings, SettingsStore};
 use std::sync::Arc;
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 use util::path;
@@ -551,6 +552,150 @@ async fn test_context_server_enabled_disabled(cx: &mut TestAppContext) {
 
         cx.run_until_parked();
     }
+}
+
+#[test]
+fn test_secret_resolution_failure_isolated_per_server() {
+    let resolver = SecretResolver::new();
+    let failing_secret = SecretReference {
+        provider: "unsupported".to_string(),
+        reference: "ignored".to_string(),
+    };
+    let working_secret = SecretReference {
+        provider: "command".to_string(),
+        reference: "echo resolved-token".to_string(),
+    };
+
+    let pre_resolve_result =
+        smol::block_on(resolver.pre_resolve(&[failing_secret.clone(), working_secret.clone()]));
+
+    assert!(
+        pre_resolve_result.is_err(),
+        "pre-resolving should report the failing secret"
+    );
+
+    let resolved = resolver
+        .resolve_env_map(
+            &std::iter::once((
+                "TOKEN".to_string(),
+                EnvValue::Secret {
+                    secret: working_secret,
+                },
+            ))
+            .collect(),
+        )
+        .expect("working secret should still resolve after another secret fails");
+
+    assert_eq!(
+        resolved.get("TOKEN"),
+        Some(&EnvValue::Plain("resolved-token".to_string()))
+    );
+
+    let failing_result = resolver.resolve_env_map(
+        &std::iter::once((
+            "TOKEN".to_string(),
+            EnvValue::Secret {
+                secret: failing_secret,
+            },
+        ))
+        .collect(),
+    );
+    assert!(
+        failing_result.is_err(),
+        "failing secret should retain its provider error"
+    );
+}
+
+#[gpui::test]
+async fn test_secret_resolution_failure_keeps_server_in_error_state(cx: &mut TestAppContext) {
+    const SERVER_ID: &str = "secret-regression";
+
+    let server_id = ContextServerId(SERVER_ID.into());
+
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+
+    let executor = cx.executor();
+    let store = project.read_with(cx, |project, _| project.context_server_store());
+    store.update(cx, |store, _| {
+        store.set_context_server_factory(Box::new(move |id, _| {
+            Arc::new(ContextServer::new(
+                id.clone(),
+                Arc::new(create_fake_transport(id.0.to_string(), executor.clone())),
+            ))
+        }));
+    });
+
+    set_context_server_configuration(
+        vec![(
+            server_id.0.clone(),
+            settings::ContextServerSettingsContent::Stdio {
+                enabled: true,
+                remote: false,
+                command: ContextServerCommand {
+                    path: "somebinary".into(),
+                    args: vec![],
+                    env: None,
+                    timeout: None,
+                },
+            },
+        )],
+        cx,
+    );
+
+    {
+        let _server_events = assert_server_events(
+            &store,
+            vec![
+                (server_id.clone(), ContextServerStatus::Starting),
+                (server_id.clone(), ContextServerStatus::Running),
+            ],
+            cx,
+        );
+        cx.run_until_parked();
+    }
+
+    {
+        set_context_server_configuration(
+            vec![(
+                server_id.0.clone(),
+                settings::ContextServerSettingsContent::Stdio {
+                    enabled: true,
+                    remote: false,
+                    command: ContextServerCommand {
+                        path: "somebinary".into(),
+                        args: vec![],
+                        env: Some(
+                            std::iter::once((
+                                "TOKEN".to_string(),
+                                EnvValue::Secret {
+                                    secret: SecretReference {
+                                        provider: "unsupported".to_string(),
+                                        reference: "ignored".to_string(),
+                                    },
+                                },
+                            ))
+                            .collect(),
+                        ),
+                        timeout: None,
+                    },
+                },
+            )],
+            cx,
+        );
+
+        cx.run_until_parked();
+    }
+
+    cx.update(|cx| {
+        assert!(matches!(
+            store.read(cx).status_for_server(&server_id),
+            Some(ContextServerStatus::Error(_))
+        ));
+        assert!(
+            store.read(cx).server_ids().contains(&server_id),
+            "configured server should remain visible after a secret resolution failure"
+        );
+    });
 }
 
 #[gpui::test]

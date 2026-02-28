@@ -32,7 +32,7 @@ use project::{
 };
 use remote::RemoteClient;
 use serde_json::json;
-use settings::{Settings, SettingsLocation, SettingsStore, initial_server_settings_content};
+use settings::{EnvValue, Settings, SettingsLocation, SettingsStore, initial_server_settings_content};
 use smol::stream::StreamExt;
 use std::{
     path::{Path, PathBuf},
@@ -2183,9 +2183,9 @@ async fn test_remote_external_agent_server(
             path: "mock".into(),
             args: vec!["foo-cli".into(), "--flag".into()],
             env: Some(HashMap::from_iter([
-                ("NO_BROWSER".into(), "1".into()),
-                ("VAR".into(), "val".into()),
-                ("OTHER_VAR".into(), "other-val".into())
+                ("NO_BROWSER".into(), EnvValue::Plain("1".into())),
+                ("VAR".into(), EnvValue::Plain("val".into())),
+                ("OTHER_VAR".into(), EnvValue::Plain("other-val".into()))
             ]))
         }
     );

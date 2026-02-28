@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use context_server::ContextServerCommand;
+use context_server::{ContextServerCommand, EnvValue};
 use extension::{
     ContextServerConfiguration, Extension, ExtensionContextServerProxy, ExtensionHostProxy,
     ProjectDelegate,
@@ -68,7 +68,13 @@ impl registry::ContextServerDescriptor for ContextServerDescriptor {
             Ok(ContextServerCommand {
                 path: command.command,
                 args: command.args,
-                env: Some(command.env.into_iter().collect()),
+                env: Some(
+                    command
+                        .env
+                        .into_iter()
+                        .map(|(k, v)| (k, EnvValue::Plain(v)))
+                        .collect(),
+                ),
                 timeout: None,
             })
         })

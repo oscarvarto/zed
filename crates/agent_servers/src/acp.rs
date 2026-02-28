@@ -12,6 +12,7 @@ use futures::io::BufReader;
 use project::Project;
 use project::agent_server_store::{AgentServerCommand, GEMINI_NAME};
 use serde::Deserialize;
+use settings::EnvValue;
 use settings::Settings as _;
 use task::ShellBuilder;
 use util::ResultExt as _;
@@ -194,7 +195,13 @@ impl AcpConnection {
         let builder = ShellBuilder::new(&shell, cfg!(windows)).non_interactive();
         let mut child =
             builder.build_std_command(Some(command.path.display().to_string()), &command.args);
-        child.envs(command.env.iter().flatten());
+        child.envs(
+            command
+                .env
+                .iter()
+                .flatten()
+                .filter_map(|(key, value)| value.as_plain().map(|value| (key, value))),
+        );
         let mut child = Child::spawn(child, Stdio::piped(), Stdio::piped(), Stdio::piped())?;
 
         let stdout = child.stdout.take().context("Failed to take stdout")?;
@@ -327,7 +334,14 @@ impl AcpConnection {
                 "label": "gemini /auth",
                 "command": command.path.to_string_lossy().into_owned(),
                 "args": args,
-                "env": command.env.clone().unwrap_or_default(),
+                "env": command.env.clone().map(|env| {
+                    env.into_iter()
+                        .filter_map(|(key, value)| match value {
+                            EnvValue::Plain(value) => Some((key, value)),
+                            EnvValue::Secret { .. } => None,
+                        })
+                        .collect::<HashMap<_, _>>()
+                }).unwrap_or_default(),
             });
             let meta = acp::Meta::from_iter([("terminal-auth".to_string(), value)]);
             vec![
@@ -938,7 +952,9 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                         .args(command.args.clone())
                         .env(if let Some(env) = command.env.as_ref() {
                             env.iter()
-                                .map(|(name, value)| acp::EnvVariable::new(name, value))
+                                .filter_map(|(name, value)| {
+                                    value.as_plain().map(|v| acp::EnvVariable::new(name, v))
+                                })
                                 .collect()
                         } else {
                             vec![]

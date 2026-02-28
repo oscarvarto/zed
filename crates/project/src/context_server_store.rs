@@ -14,12 +14,13 @@ use itertools::Itertools;
 use registry::ContextServerDescriptorRegistry;
 use remote::RemoteClient;
 use rpc::{AnyProtoClient, TypedEnvelope, proto};
-use settings::{Settings as _, SettingsStore};
+use settings::{EnvValue, Settings as _, SettingsStore};
 use util::{ResultExt as _, rel_path::RelPath};
 
 use crate::{
     DisableAiSettings, Project,
     project_settings::{ContextServerSettings, ProjectSettings},
+    secret_resolver::SecretResolver,
     worktree_store::WorktreeStore,
 };
 
@@ -73,27 +74,27 @@ enum ContextServerState {
         configuration: Arc<ContextServerConfiguration>,
     },
     Error {
-        server: Arc<ContextServer>,
-        configuration: Arc<ContextServerConfiguration>,
+        server: Option<Arc<ContextServer>>,
+        configuration: Option<Arc<ContextServerConfiguration>>,
         error: Arc<str>,
     },
 }
 
 impl ContextServerState {
-    pub fn server(&self) -> Arc<ContextServer> {
+    pub fn server(&self) -> Option<Arc<ContextServer>> {
         match self {
-            ContextServerState::Starting { server, .. } => server.clone(),
-            ContextServerState::Running { server, .. } => server.clone(),
-            ContextServerState::Stopped { server, .. } => server.clone(),
+            ContextServerState::Starting { server, .. } => Some(server.clone()),
+            ContextServerState::Running { server, .. } => Some(server.clone()),
+            ContextServerState::Stopped { server, .. } => Some(server.clone()),
             ContextServerState::Error { server, .. } => server.clone(),
         }
     }
 
-    pub fn configuration(&self) -> Arc<ContextServerConfiguration> {
+    pub fn configuration(&self) -> Option<Arc<ContextServerConfiguration>> {
         match self {
-            ContextServerState::Starting { configuration, .. } => configuration.clone(),
-            ContextServerState::Running { configuration, .. } => configuration.clone(),
-            ContextServerState::Stopped { configuration, .. } => configuration.clone(),
+            ContextServerState::Starting { configuration, .. } => Some(configuration.clone()),
+            ContextServerState::Running { configuration, .. } => Some(configuration.clone()),
+            ContextServerState::Stopped { configuration, .. } => Some(configuration.clone()),
             ContextServerState::Error { configuration, .. } => configuration.clone(),
         }
     }
@@ -139,57 +140,72 @@ impl ContextServerConfiguration {
         id: ContextServerId,
         registry: Entity<ContextServerDescriptorRegistry>,
         worktree_store: Entity<WorktreeStore>,
+        secret_resolver: SecretResolver,
         cx: &AsyncApp,
-    ) -> Option<Self> {
+    ) -> Result<Self> {
         const EXTENSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
         match settings {
             ContextServerSettings::Stdio {
                 enabled: _,
-                command,
+                mut command,
                 remote,
-            } => Some(ContextServerConfiguration::Custom { command, remote }),
+            } => {
+                if let Some(env) = &command.env {
+                    command.env =
+                        Some(secret_resolver.resolve_env_map(env).with_context(|| {
+                            format!("failed to resolve secrets for context server {id}")
+                        })?);
+                }
+                Ok(ContextServerConfiguration::Custom { command, remote })
+            }
             ContextServerSettings::Extension {
                 enabled: _,
                 settings,
                 remote,
             } => {
-                let descriptor =
-                    cx.update(|cx| registry.read(cx).context_server_descriptor(&id.0))?;
+                let descriptor = cx
+                    .update(|cx| registry.read(cx).context_server_descriptor(&id.0))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("missing descriptor for extension context server {id}")
+                    })?;
 
                 let command_future = descriptor.command(worktree_store, cx);
                 let timeout_future = cx.background_executor().timer(EXTENSION_COMMAND_TIMEOUT);
 
                 match futures::future::select(command_future, timeout_future).await {
-                    Either::Left((Ok(command), _)) => Some(ContextServerConfiguration::Extension {
+                    Either::Left((Ok(command), _)) => Ok(ContextServerConfiguration::Extension {
                         command,
                         settings,
                         remote,
                     }),
-                    Either::Left((Err(e), _)) => {
-                        log::error!(
-                            "Failed to create context server configuration from settings: {e:#}"
-                        );
-                        None
-                    }
+                    Either::Left((Err(err), _)) => Err(err).with_context(|| {
+                        format!("failed to resolve command for extension context server {id}")
+                    }),
                     Either::Right(_) => {
-                        log::error!(
-                            "Timed out resolving command for extension context server {id}"
-                        );
-                        None
+                        anyhow::bail!(
+                            "timed out resolving command for extension context server {id}"
+                        )
                     }
                 }
             }
             ContextServerSettings::Http {
                 enabled: _,
                 url,
-                headers: auth,
+                headers,
                 timeout,
             } => {
-                let url = url::Url::parse(&url).log_err()?;
-                Some(ContextServerConfiguration::Http {
+                let url = url::Url::parse(&url)
+                    .with_context(|| format!("invalid URL for context server {id}: {url}"))?;
+                let resolved_headers = secret_resolver
+                    .resolve_env_map(&headers)
+                    .with_context(|| format!("failed to resolve headers for context server {id}"))?
+                    .into_iter()
+                    .map(|(key, value)| Ok((key, value.into_plain_string()?)))
+                    .collect::<Result<HashMap<_, _>>>()?;
+                Ok(ContextServerConfiguration::Http {
                     url,
-                    headers: auth,
+                    headers: resolved_headers,
                     timeout,
                 })
             }
@@ -215,12 +231,14 @@ pub struct ContextServerStore {
     state: ContextServerStoreState,
     context_server_settings: HashMap<Arc<str>, ContextServerSettings>,
     servers: HashMap<ContextServerId, ContextServerState>,
+    failed_servers: HashMap<ContextServerId, Arc<str>>,
     server_ids: Vec<ContextServerId>,
     worktree_store: Entity<WorktreeStore>,
     project: Option<WeakEntity<Project>>,
     registry: Entity<ContextServerDescriptorRegistry>,
     update_servers_task: Option<Task<Result<()>>>,
     context_server_factory: Option<ContextServerFactory>,
+    secret_resolver: SecretResolver,
     needs_server_update: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -405,9 +423,11 @@ impl ContextServerStore {
             registry,
             needs_server_update: false,
             servers: HashMap::default(),
+            failed_servers: HashMap::default(),
             server_ids: Default::default(),
             update_servers_task: None,
             context_server_factory,
+            secret_resolver: SecretResolver::new(),
         };
         if maintain_server_loop {
             this.available_context_servers_changed(cx);
@@ -416,7 +436,7 @@ impl ContextServerStore {
     }
 
     pub fn get_server(&self, id: &ContextServerId) -> Option<Arc<ContextServer>> {
-        self.servers.get(id).map(|state| state.server())
+        self.servers.get(id).and_then(|state| state.server())
     }
 
     pub fn get_running_server(&self, id: &ContextServerId) -> Option<Arc<ContextServer>> {
@@ -428,6 +448,9 @@ impl ContextServerStore {
     }
 
     pub fn status_for_server(&self, id: &ContextServerId) -> Option<ContextServerStatus> {
+        if let Some(error) = self.failed_servers.get(id) {
+            return Some(ContextServerStatus::Error(error.clone()));
+        }
         self.servers.get(id).map(ContextServerStatus::from_state)
     }
 
@@ -435,7 +458,7 @@ impl ContextServerStore {
         &self,
         id: &ContextServerId,
     ) -> Option<Arc<ContextServerConfiguration>> {
-        self.servers.get(id).map(|state| state.configuration())
+        self.servers.get(id).and_then(|state| state.configuration())
     }
 
     /// Returns a sorted slice of available unique context server IDs. Within the
@@ -506,14 +529,19 @@ impl ContextServerStore {
                 return anyhow::Ok(());
             }
 
-            let (registry, worktree_store) = this.update(cx, |this, _| {
-                (this.registry.clone(), this.worktree_store.clone())
+            let (registry, worktree_store, secret_resolver) = this.update(cx, |this, _| {
+                (
+                    this.registry.clone(),
+                    this.worktree_store.clone(),
+                    this.secret_resolver.clone(),
+                )
             });
             let configuration = ContextServerConfiguration::from_settings(
                 settings,
                 server.id(),
                 registry,
                 worktree_store,
+                secret_resolver.clone(),
                 cx,
             )
             .await
@@ -535,6 +563,7 @@ impl ContextServerStore {
             return Ok(());
         }
 
+        self.failed_servers.remove(id);
         let state = self
             .servers
             .remove(id)
@@ -548,14 +577,21 @@ impl ContextServerStore {
         }
         drop(state);
 
-        self.update_server_state(
-            id.clone(),
-            ContextServerState::Stopped {
-                configuration,
-                server,
-            },
-            cx,
-        );
+        if let (Some(configuration), Some(server)) = (configuration, server) {
+            self.update_server_state(
+                id.clone(),
+                ContextServerState::Stopped {
+                    configuration,
+                    server,
+                },
+                cx,
+            );
+        } else {
+            cx.emit(ServerStatusChangedEvent {
+                server_id: id.clone(),
+                status: ContextServerStatus::Stopped,
+            });
+        }
 
         result
     }
@@ -601,8 +637,8 @@ impl ContextServerStore {
                             this.update_server_state(
                                 id.clone(),
                                 ContextServerState::Error {
-                                    configuration,
-                                    server,
+                                    configuration: Some(configuration),
+                                    server: Some(server),
                                     error: err.to_string().into(),
                                 },
                                 cx,
@@ -626,11 +662,11 @@ impl ContextServerStore {
     }
 
     fn remove_server(&mut self, id: &ContextServerId, cx: &mut Context<Self>) -> Result<()> {
-        let state = self
-            .servers
-            .remove(id)
-            .context("Context server not found")?;
-        drop(state);
+        let state = self.servers.remove(id);
+        let had_failure = self.failed_servers.remove(id).is_some();
+        if state.is_none() && !had_failure {
+            anyhow::bail!("Context server not found");
+        }
         cx.emit(ServerStatusChangedEvent {
             server_id: id.clone(),
             status: ContextServerStatus::Stopped,
@@ -712,7 +748,13 @@ impl ContextServerStore {
             let command = ContextServerCommand {
                 path: remote_command.program.into(),
                 args: remote_command.args,
-                env: Some(remote_command.env.into_iter().collect()),
+                env: Some(
+                    remote_command
+                        .env
+                        .into_iter()
+                        .map(|(k, v)| (k, EnvValue::Plain(v)))
+                        .collect(),
+                ),
                 timeout: None,
             };
 
@@ -777,34 +819,43 @@ impl ContextServerStore {
     ) -> Result<proto::ContextServerCommand> {
         let server_id = ContextServerId(envelope.payload.server_id.into());
 
-        let (settings, registry, worktree_store) = this.update(&mut cx, |this, inner_cx| {
-            let ContextServerStoreState::Local {
-                is_headless: true, ..
-            } = &this.state
-            else {
-                anyhow::bail!("unexpected GetContextServerCommand request in a non-local project");
-            };
+        let (settings, registry, worktree_store, secret_resolver) =
+            this.update(&mut cx, |this, inner_cx| {
+                let ContextServerStoreState::Local {
+                    is_headless: true, ..
+                } = &this.state
+                else {
+                    anyhow::bail!(
+                        "unexpected GetContextServerCommand request in a non-local project"
+                    );
+                };
 
-            let settings = this
-                .context_server_settings
-                .get(&server_id.0)
-                .cloned()
-                .or_else(|| {
-                    this.registry
-                        .read(inner_cx)
-                        .context_server_descriptor(&server_id.0)
-                        .map(|_| ContextServerSettings::default_extension())
-                })
-                .with_context(|| format!("context server `{}` not found", server_id))?;
+                let settings = this
+                    .context_server_settings
+                    .get(&server_id.0)
+                    .cloned()
+                    .or_else(|| {
+                        this.registry
+                            .read(inner_cx)
+                            .context_server_descriptor(&server_id.0)
+                            .map(|_| ContextServerSettings::default_extension())
+                    })
+                    .with_context(|| format!("context server `{}` not found", server_id))?;
 
-            anyhow::Ok((settings, this.registry.clone(), this.worktree_store.clone()))
-        })?;
+                anyhow::Ok((
+                    settings,
+                    this.registry.clone(),
+                    this.worktree_store.clone(),
+                    this.secret_resolver.clone(),
+                ))
+            })?;
 
         let configuration = ContextServerConfiguration::from_settings(
             settings,
             server_id.clone(),
             registry,
             worktree_store,
+            secret_resolver.clone(),
             &cx,
         )
         .await
@@ -820,7 +871,17 @@ impl ContextServerStore {
             env: command
                 .env
                 .clone()
-                .map(|env| env.into_iter().collect())
+                .map(|env| {
+                    env.into_iter()
+                        .filter_map(|(k, v)| match v {
+                            EnvValue::Plain(s) => Some((k, s)),
+                            EnvValue::Secret { .. } => {
+                                log::error!("unresolved secret for env var '{k}' in proto handler");
+                                None
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
     }
@@ -846,12 +907,31 @@ impl ContextServerStore {
         state: ContextServerState,
         cx: &mut Context<Self>,
     ) {
+        self.failed_servers.remove(&id);
         let status = ContextServerStatus::from_state(&state);
         self.servers.insert(id.clone(), state);
         cx.emit(ServerStatusChangedEvent {
             server_id: id,
             status,
         });
+    }
+
+    fn update_server_error(
+        &mut self,
+        id: ContextServerId,
+        error: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_server_state(
+            id.clone(),
+            ContextServerState::Error {
+                server: None,
+                configuration: None,
+                error: error.clone(),
+            },
+            cx,
+        );
+        self.failed_servers.insert(id, error);
     }
 
     fn available_context_servers_changed(&mut self, cx: &mut Context<Self>) {
@@ -892,13 +972,15 @@ impl ContextServerStore {
             return Ok(());
         }
 
-        let (mut configured_servers, registry, worktree_store) = this.update(cx, |this, _| {
-            (
-                this.context_server_settings.clone(),
-                this.registry.clone(),
-                this.worktree_store.clone(),
-            )
-        })?;
+        let (mut configured_servers, registry, worktree_store, secret_resolver) =
+            this.update(cx, |this, _| {
+                (
+                    this.context_server_settings.clone(),
+                    this.registry.clone(),
+                    this.worktree_store.clone(),
+                    this.secret_resolver.clone(),
+                )
+            })?;
 
         for (id, _) in registry.read_with(cx, |registry, _| registry.context_server_descriptors()) {
             configured_servers
@@ -911,31 +993,69 @@ impl ContextServerStore {
                 .into_iter()
                 .partition(|(_, settings)| settings.enabled());
 
+        // Collect all secret references from enabled servers and pre-resolve them
+        // sequentially. This ensures providers like 1Password only prompt for
+        // biometric authentication once.
+        let all_secrets: Vec<_> = enabled_servers
+            .values()
+            .flat_map(|settings| match settings {
+                ContextServerSettings::Stdio { command, .. } => command
+                    .env
+                    .as_ref()
+                    .map_or_else(Vec::new, SecretResolver::collect_secrets),
+                ContextServerSettings::Http { headers, .. } => {
+                    SecretResolver::collect_secrets(headers)
+                }
+                ContextServerSettings::Extension { .. } => Vec::new(),
+            })
+            .collect();
+
+        if !all_secrets.is_empty() {
+            if let Err(err) = secret_resolver.pre_resolve(&all_secrets).await {
+                log::error!("Failed to pre-resolve secrets: {err:#}");
+            }
+        }
+
         let configured_servers = join_all(enabled_servers.into_iter().map(|(id, settings)| {
             let id = ContextServerId(id);
+            let secret_resolver = secret_resolver.clone();
             ContextServerConfiguration::from_settings(
                 settings,
                 id.clone(),
                 registry.clone(),
                 worktree_store.clone(),
+                secret_resolver,
                 cx,
             )
             .map(move |config| (id, config))
         }))
-        .await
-        .into_iter()
-        .filter_map(|(id, config)| config.map(|config| (id, config)))
-        .collect::<HashMap<_, _>>();
+        .await;
+
+        let mut desired_servers = HashSet::default();
+        let mut resolved_servers = HashMap::default();
+        let mut configuration_errors = HashMap::default();
+        for (id, configuration) in configured_servers {
+            desired_servers.insert(id.clone());
+            match configuration {
+                Ok(configuration) => {
+                    resolved_servers.insert(id, configuration);
+                }
+                Err(err) => {
+                    configuration_errors.insert(id, Arc::<str>::from(err.to_string()));
+                }
+            }
+        }
 
         let mut servers_to_start = Vec::new();
         let mut servers_to_remove = HashSet::default();
         let mut servers_to_stop = HashSet::default();
+        let mut servers_to_error = Vec::new();
 
         this.update(cx, |this, _cx| {
             for server_id in this.servers.keys() {
                 // All servers that are not in desired_servers should be removed from the store.
                 // This can happen if the user removed a server from the context server settings.
-                if !configured_servers.contains_key(server_id) {
+                if !desired_servers.contains(server_id) {
                     if disabled_servers.contains_key(&server_id.0) {
                         servers_to_stop.insert(server_id.clone());
                     } else {
@@ -944,10 +1064,31 @@ impl ContextServerStore {
                 }
             }
 
-            for (id, config) in configured_servers {
+            for (id, error) in &configuration_errors {
+                let state = this.servers.get(id);
+                let same_error = matches!(
+                    state,
+                    Some(ContextServerState::Error {
+                        server: None,
+                        configuration: None,
+                        error: existing_error,
+                    }) if existing_error == error
+                );
+
+                if same_error {
+                    continue;
+                }
+
+                if this.servers.contains_key(id) {
+                    servers_to_stop.insert(id.clone());
+                }
+                servers_to_error.push((id.clone(), error.clone()));
+            }
+
+            for (id, config) in resolved_servers {
                 let state = this.servers.get(&id);
                 let is_stopped = matches!(state, Some(ContextServerState::Stopped { .. }));
-                let existing_config = state.as_ref().map(|state| state.configuration());
+                let existing_config = state.as_ref().and_then(|state| state.configuration());
                 if existing_config.as_deref() != Some(&config) || is_stopped {
                     let config = Arc::new(config);
                     servers_to_start.push((id.clone(), config));
@@ -966,6 +1107,9 @@ impl ContextServerStore {
             }
             for id in servers_to_remove {
                 this.remove_server(&id, inner_cx)?;
+            }
+            for (id, error) in servers_to_error {
+                this.update_server_error(id, error, inner_cx);
             }
             anyhow::Ok(())
         })??;

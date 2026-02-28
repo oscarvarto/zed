@@ -197,8 +197,9 @@ pub enum ContextServerSettings {
         /// The URL of the remote context server.
         url: String,
         /// Optional authentication configuration for the remote server.
+        /// Values can be plain strings or secret references.
         #[serde(skip_serializing_if = "HashMap::is_empty", default)]
-        headers: HashMap<String, String>,
+        headers: HashMap<String, settings::EnvValue>,
         /// Timeout for tool calls in milliseconds.
         timeout: Option<u64>,
     },

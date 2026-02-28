@@ -696,7 +696,11 @@ impl VsCodeSettings {
                             .map(|cmd| ContextServerCommand {
                                 path: cmd.command,
                                 args: cmd.args.unwrap_or_default(),
-                                env: cmd.env,
+                                env: cmd.env.map(|env| {
+                                    env.into_iter()
+                                        .map(|(k, v)| (k, EnvValue::Plain(v)))
+                                        .collect()
+                                }),
                                 timeout: None,
                             })?,
                     },

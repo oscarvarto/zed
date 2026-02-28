@@ -4,6 +4,7 @@ use gpui::{AppContext, AsyncApp, SharedString, Task, TestAppContext};
 use node_runtime::NodeRuntime;
 use project::worktree_store::WorktreeStore;
 use project::{agent_server_store::*, worktree_store::WorktreeIdCounter};
+use settings::{EnvValue, SecretReference};
 use std::{any::Any, path::PathBuf, sync::Arc};
 
 #[test]
@@ -153,17 +154,22 @@ async fn archive_agent_uses_extension_and_agent_id_for_cache_key(cx: &mut TestAp
             );
             map
         },
-        env: {
+        distribution_env: {
             let mut map = HashMap::default();
             map.insert("PORT".into(), "8080".into());
             map
         },
+        settings_env: HashMap::default(),
+        secret_resolver: project::secret_resolver::SecretResolver::new(),
     };
 
     // Verify agent is properly constructed
     assert_eq!(agent.extension_id.as_ref(), "my-extension");
     assert_eq!(agent.agent_id.as_ref(), "my-agent");
-    assert_eq!(agent.env.get("PORT"), Some(&"8080".to_string()));
+    assert_eq!(
+        agent.distribution_env.get("PORT"),
+        Some(&"8080".to_string())
+    );
     assert!(agent.targets.contains_key("darwin-aarch64"));
 }
 
@@ -235,7 +241,9 @@ async fn test_node_command_uses_managed_runtime(cx: &mut TestAppContext) {
             );
             map
         },
-        env: HashMap::default(),
+        distribution_env: HashMap::default(),
+        settings_env: HashMap::default(),
+        secret_resolver: project::secret_resolver::SecretResolver::new(),
     };
 
     // Verify that when cmd is "node", it attempts to use the node runtime
@@ -283,7 +291,9 @@ async fn test_commands_run_in_extraction_directory(cx: &mut TestAppContext) {
             );
             map
         },
-        env: Default::default(),
+        distribution_env: Default::default(),
+        settings_env: Default::default(),
+        secret_resolver: project::secret_resolver::SecretResolver::new(),
     };
 
     // Verify the agent is configured with relative paths in args
@@ -299,7 +309,19 @@ fn test_tilde_expansion_in_settings() {
     let settings = settings::CustomAgentServerSettings::Custom {
         path: PathBuf::from("~/custom/agent"),
         args: vec!["serve".into()],
-        env: Default::default(),
+        env: {
+            let mut map = HashMap::default();
+            map.insert(
+                "API_TOKEN".to_string(),
+                EnvValue::Secret {
+                    secret: SecretReference {
+                        provider: "1password".to_string(),
+                        reference: "op://vault/item/token".to_string(),
+                    },
+                },
+            );
+            map
+        },
         default_mode: None,
         default_model: None,
         favorite_models: vec![],
@@ -309,7 +331,7 @@ fn test_tilde_expansion_in_settings() {
 
     let converted: CustomAgentServerSettings = settings.into();
     let CustomAgentServerSettings::Custom {
-        command: AgentServerCommand { path, .. },
+        command: AgentServerCommand { path, env, .. },
         ..
     } = converted
     else {
@@ -320,4 +342,8 @@ fn test_tilde_expansion_in_settings() {
         !path.to_string_lossy().starts_with("~"),
         "Tilde should be expanded for custom agent path"
     );
+    assert!(matches!(
+        env.and_then(|env| env.get("API_TOKEN").cloned()),
+        Some(EnvValue::Secret { .. })
+    ));
 }
