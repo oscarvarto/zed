@@ -984,7 +984,13 @@ impl ExtensionImports for WasmState {
                                 command: Some(settings::CommandSettings {
                                     path: command.path.to_str().map(|path| path.to_string()),
                                     arguments: Some(command.args),
-                                    env: command.env.map(|env| env.into_iter().collect()),
+                                    env: command.env.map(|env| {
+                                        env.into_iter()
+                                            .filter_map(|(k, v)| {
+                                                v.into_plain_string().ok().map(|s| (k, s))
+                                            })
+                                            .collect()
+                                    }),
                                 }),
                                 settings: None,
                             })?),

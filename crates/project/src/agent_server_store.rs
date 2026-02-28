@@ -19,13 +19,14 @@ use rpc::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{RegisterSetting, SettingsStore};
+use settings::{EnvValue, RegisterSetting, SettingsStore};
 use sha2::{Digest, Sha256};
 use task::Shell;
 use util::{ResultExt as _, debug_panic};
 
 use crate::ProjectEnvironment;
 use crate::agent_registry_store::{AgentRegistryStore, RegistryAgent, RegistryTargetConfig};
+use crate::secret_resolver::SecretResolver;
 
 #[derive(Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema)]
 pub struct AgentServerCommand {
@@ -33,7 +34,7 @@ pub struct AgentServerCommand {
     pub path: PathBuf,
     #[serde(default)]
     pub args: Vec<String>,
-    pub env: Option<HashMap<String, String>>,
+    pub env: Option<HashMap<String, EnvValue>>,
 }
 
 impl std::fmt::Debug for AgentServerCommand {
@@ -41,14 +42,17 @@ impl std::fmt::Debug for AgentServerCommand {
         let filtered_env = self.env.as_ref().map(|env| {
             env.iter()
                 .map(|(k, v)| {
-                    (
-                        k,
-                        if util::redact::should_redact(k) {
-                            "[REDACTED]"
-                        } else {
-                            v
-                        },
-                    )
+                    let display_value: &dyn std::fmt::Debug = match v {
+                        EnvValue::Secret { .. } => &"[SECRET]",
+                        EnvValue::Plain(value) => {
+                            if util::redact::should_redact(k) {
+                                &"[REDACTED]"
+                            } else {
+                                value
+                            }
+                        }
+                    };
+                    (k, display_value)
                 })
                 .collect::<Vec<_>>()
         });
@@ -164,11 +168,28 @@ impl ExternalAgentEntry {
 pub struct AgentServerStore {
     state: AgentServerStoreState,
     pub external_agents: HashMap<ExternalAgentServerName, ExternalAgentEntry>,
+    secret_resolver: SecretResolver,
 }
 
 pub struct AgentServersUpdated;
 
 impl EventEmitter<AgentServersUpdated> for AgentServerStore {}
+
+async fn resolve_plain_env_map(
+    secret_resolver: &SecretResolver,
+    env: HashMap<String, EnvValue>,
+) -> Result<HashMap<String, String>> {
+    let secrets = SecretResolver::collect_secrets(&env);
+    if !secrets.is_empty() {
+        secret_resolver.pre_resolve(&secrets).await.log_err();
+    }
+
+    secret_resolver
+        .resolve_env_map(&env)?
+        .into_iter()
+        .map(|(key, value)| Ok((key, value.into_plain_string()?)))
+        .collect()
+}
 
 impl AgentServerStore {
     /// Synchronizes extension-provided agent servers with the store.
@@ -377,6 +398,7 @@ impl AgentServerStore {
     }
 
     fn reregister_agents(&mut self, cx: &mut Context<Self>) {
+        let secret_resolver = self.secret_resolver.clone();
         let AgentServerStoreState::Local {
             node_runtime,
             fs,
@@ -425,17 +447,13 @@ impl AgentServerStore {
         // Insert extension agents before custom/registry so registry entries override extensions.
         for (agent_name, ext_id, targets, env, icon_path, display_name) in extension_agents.iter() {
             let name = ExternalAgentServerName(agent_name.clone().into());
-            let mut env = env.clone();
-            if let Some(settings_env) =
-                new_settings
-                    .get(agent_name.as_ref())
-                    .and_then(|settings| match settings {
-                        CustomAgentServerSettings::Extension { env, .. } => Some(env.clone()),
-                        _ => None,
-                    })
-            {
-                env.extend(settings_env);
-            }
+            let settings_env = new_settings
+                .get(agent_name.as_ref())
+                .and_then(|settings| match settings {
+                    CustomAgentServerSettings::Extension { env, .. } => Some(env.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
             let icon = icon_path
                 .as_ref()
                 .map(|path| SharedString::from(path.clone()));
@@ -450,8 +468,10 @@ impl AgentServerStore {
                         project_environment: project_environment.clone(),
                         extension_id: Arc::from(&**ext_id),
                         targets: targets.clone(),
-                        env,
+                        distribution_env: env.clone(),
+                        settings_env,
                         agent_id: agent_name.clone(),
+                        secret_resolver: secret_resolver.clone(),
                     }) as Box<dyn ExternalAgentServer>,
                     ExternalAgentSource::Extension,
                     icon,
@@ -470,6 +490,7 @@ impl AgentServerStore {
                             Box::new(LocalCustomAgent {
                                 command: command.clone(),
                                 project_environment: project_environment.clone(),
+                                secret_resolver: secret_resolver.clone(),
                             }) as Box<dyn ExternalAgentServer>,
                             ExternalAgentSource::Custom,
                             None,
@@ -506,7 +527,8 @@ impl AgentServerStore {
                                         project_environment: project_environment.clone(),
                                         registry_id: Arc::from(name.as_str()),
                                         targets: agent.targets.clone(),
-                                        env: env.clone(),
+                                        settings_env: env.clone(),
+                                        secret_resolver: secret_resolver.clone(),
                                     })
                                         as Box<dyn ExternalAgentServer>,
                                     ExternalAgentSource::Registry,
@@ -526,6 +548,7 @@ impl AgentServerStore {
                                         args: agent.args.clone(),
                                         distribution_env: agent.env.clone(),
                                         settings_env: env.clone(),
+                                        secret_resolver: secret_resolver.clone(),
                                     })
                                         as Box<dyn ExternalAgentServer>,
                                     ExternalAgentSource::Registry,
@@ -591,6 +614,7 @@ impl AgentServerStore {
                 _subscriptions: subscriptions,
             },
             external_agents: HashMap::default(),
+            secret_resolver: SecretResolver::new(),
         };
         if let Some(_events) = extension::ExtensionEvents::try_global(cx) {}
         this.agent_servers_settings_changed(cx);
@@ -604,6 +628,7 @@ impl AgentServerStore {
                 upstream_client,
             },
             external_agents: HashMap::default(),
+            secret_resolver: SecretResolver::new(),
         }
     }
 
@@ -611,6 +636,7 @@ impl AgentServerStore {
         Self {
             state: AgentServerStoreState::Collab,
             external_agents: HashMap::default(),
+            secret_resolver: SecretResolver::new(),
         }
     }
 
@@ -734,7 +760,12 @@ impl AgentServerStore {
             args: command.args,
             env: command
                 .env
-                .map(|env| env.into_iter().collect())
+                .map(|env| {
+                    env.into_iter()
+                        .map(|(key, value)| Ok((key, value.into_plain_string()?)))
+                        .collect::<Result<std::collections::HashMap<_, _>>>()
+                })
+                .transpose()?
                 .unwrap_or_default(),
             // root_dir and login are no longer used, but returned for backwards compatibility
             root_dir: paths::home_dir().to_string_lossy().to_string(),
@@ -936,7 +967,13 @@ impl ExternalAgentServer for RemoteExternalAgentServer {
             Ok(AgentServerCommand {
                 path: command.program.into(),
                 args: command.args,
-                env: Some(command.env),
+                env: Some(
+                    command
+                        .env
+                        .into_iter()
+                        .map(|(key, value)| (key, EnvValue::Plain(value)))
+                        .collect(),
+                ),
             })
         })
     }
@@ -954,7 +991,9 @@ pub struct LocalExtensionArchiveAgent {
     pub extension_id: Arc<str>,
     pub agent_id: Arc<str>,
     pub targets: HashMap<String, extension::TargetConfig>,
-    pub env: HashMap<String, String>,
+    pub distribution_env: HashMap<String, String>,
+    pub settings_env: HashMap<String, EnvValue>,
+    pub secret_resolver: SecretResolver,
 }
 
 impl ExternalAgentServer for LocalExtensionArchiveAgent {
@@ -971,7 +1010,9 @@ impl ExternalAgentServer for LocalExtensionArchiveAgent {
         let extension_id = self.extension_id.clone();
         let agent_id = self.agent_id.clone();
         let targets = self.targets.clone();
-        let base_env = self.env.clone();
+        let distribution_env = self.distribution_env.clone();
+        let settings_env = self.settings_env.clone();
+        let secret_resolver = self.secret_resolver.clone();
 
         cx.spawn(async move |cx| {
             // Get project environment
@@ -986,8 +1027,8 @@ impl ExternalAgentServer for LocalExtensionArchiveAgent {
                 .await
                 .unwrap_or_default();
 
-            // Merge manifest env and extra env
-            env.extend(base_env);
+            env.extend(distribution_env);
+            env.extend(resolve_plain_env_map(&secret_resolver, settings_env).await?);
             env.extend(extra_env);
 
             let cache_key = format!("{}/{}", extension_id, agent_id);
@@ -1134,7 +1175,11 @@ impl ExternalAgentServer for LocalExtensionArchiveAgent {
             let command = AgentServerCommand {
                 path: cmd_path,
                 args: target_config.args.clone(),
-                env: Some(env),
+                env: Some(
+                    env.into_iter()
+                        .map(|(key, value)| (key, EnvValue::Plain(value)))
+                        .collect(),
+                ),
             };
 
             Ok(command)
@@ -1153,7 +1198,8 @@ struct LocalRegistryArchiveAgent {
     project_environment: Entity<ProjectEnvironment>,
     registry_id: Arc<str>,
     targets: HashMap<String, RegistryTargetConfig>,
-    env: HashMap<String, String>,
+    settings_env: HashMap<String, EnvValue>,
+    secret_resolver: SecretResolver,
 }
 
 impl ExternalAgentServer for LocalRegistryArchiveAgent {
@@ -1169,7 +1215,8 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
         let project_environment = self.project_environment.downgrade();
         let registry_id = self.registry_id.clone();
         let targets = self.targets.clone();
-        let settings_env = self.env.clone();
+        let settings_env = self.settings_env.clone();
+        let secret_resolver = self.secret_resolver.clone();
 
         cx.spawn(async move |cx| {
             let mut env = project_environment
@@ -1221,7 +1268,7 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
 
             env.extend(target_config.env.clone());
             env.extend(extra_env);
-            env.extend(settings_env);
+            env.extend(resolve_plain_env_map(&secret_resolver, settings_env).await?);
 
             let archive_url = &target_config.archive;
 
@@ -1315,7 +1362,11 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
             let command = AgentServerCommand {
                 path: cmd_path,
                 args: target_config.args.clone(),
-                env: Some(env),
+                env: Some(
+                    env.into_iter()
+                        .map(|(key, value)| (key, EnvValue::Plain(value)))
+                        .collect(),
+                ),
             };
 
             Ok(command)
@@ -1333,7 +1384,8 @@ struct LocalRegistryNpxAgent {
     package: SharedString,
     args: Vec<String>,
     distribution_env: HashMap<String, String>,
-    settings_env: HashMap<String, String>,
+    settings_env: HashMap<String, EnvValue>,
+    secret_resolver: SecretResolver,
 }
 
 impl ExternalAgentServer for LocalRegistryNpxAgent {
@@ -1349,6 +1401,7 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
         let args = self.args.clone();
         let distribution_env = self.distribution_env.clone();
         let settings_env = self.settings_env.clone();
+        let secret_resolver = self.secret_resolver.clone();
 
         cx.spawn(async move |cx| {
             let mut env = project_environment
@@ -1380,12 +1433,16 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             env.extend(npm_command.env);
             env.extend(distribution_env);
             env.extend(extra_env);
-            env.extend(settings_env);
+            env.extend(resolve_plain_env_map(&secret_resolver, settings_env).await?);
 
             let command = AgentServerCommand {
                 path: npm_command.path,
                 args: npm_command.args,
-                env: Some(env),
+                env: Some(
+                    env.into_iter()
+                        .map(|(key, value)| (key, EnvValue::Plain(value)))
+                        .collect(),
+                ),
             };
 
             Ok(command)
@@ -1400,6 +1457,7 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
 struct LocalCustomAgent {
     project_environment: Entity<ProjectEnvironment>,
     command: AgentServerCommand,
+    secret_resolver: SecretResolver,
 }
 
 impl ExternalAgentServer for LocalCustomAgent {
@@ -1411,6 +1469,7 @@ impl ExternalAgentServer for LocalCustomAgent {
     ) -> Task<Result<AgentServerCommand>> {
         let mut command = self.command.clone();
         let project_environment = self.project_environment.downgrade();
+        let secret_resolver = self.secret_resolver.clone();
         cx.spawn(async move |cx| {
             let mut env = project_environment
                 .update(cx, |project_environment, cx| {
@@ -1422,9 +1481,15 @@ impl ExternalAgentServer for LocalCustomAgent {
                 })?
                 .await
                 .unwrap_or_default();
-            env.extend(command.env.unwrap_or_default());
+            if let Some(command_env) = command.env.take() {
+                env.extend(resolve_plain_env_map(&secret_resolver, command_env).await?);
+            }
             env.extend(extra_env);
-            command.env = Some(env);
+            command.env = Some(
+                env.into_iter()
+                    .map(|(key, value)| (key, EnvValue::Plain(value)))
+                    .collect(),
+            );
             Ok(command)
         })
     }
@@ -1499,7 +1564,7 @@ pub enum CustomAgentServerSettings {
         /// Additional environment variables to pass to the agent.
         ///
         /// Default: {}
-        env: HashMap<String, String>,
+        env: HashMap<String, EnvValue>,
         /// The default mode to use for this agent.
         ///
         /// Note: Not only all agents support modes.
@@ -1533,7 +1598,7 @@ pub enum CustomAgentServerSettings {
         /// Additional environment variables to pass to the agent.
         ///
         /// Default: {}
-        env: HashMap<String, String>,
+        env: HashMap<String, EnvValue>,
         /// The default mode to use for this agent.
         ///
         /// Note: Not only all agents support modes.

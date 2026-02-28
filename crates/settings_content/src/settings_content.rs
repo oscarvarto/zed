@@ -6,6 +6,7 @@ mod language;
 mod language_model;
 pub mod merge_from;
 mod project;
+mod secret;
 mod serde_helper;
 mod terminal;
 mod theme;
@@ -19,6 +20,7 @@ pub use language::*;
 pub use language_model::*;
 pub use merge_from::MergeFrom as MergeFromTrait;
 pub use project::*;
+pub use secret::*;
 use serde::de::DeserializeOwned;
 pub use serde_helper::{
     serialize_f32_with_two_decimal_places, serialize_optional_f32_with_two_decimal_places,

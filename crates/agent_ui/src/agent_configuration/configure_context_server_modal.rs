@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use collections::HashMap;
-use context_server::{ContextServerCommand, ContextServerId};
+use context_server::{ContextServerCommand, ContextServerId, EnvValue};
 use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
     AsyncWindowContext, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
@@ -39,7 +39,7 @@ enum ConfigurationTarget {
     ExistingHttp {
         id: ContextServerId,
         url: String,
-        headers: HashMap<String, String>,
+        headers: HashMap<String, EnvValue>,
     },
     Extension {
         id: ContextServerId,
@@ -251,7 +251,7 @@ fn context_server_input(existing: Option<(ContextServerId, ContextServerCommand)
 }
 
 fn context_server_http_input(
-    existing: Option<(ContextServerId, String, HashMap<String, String>)>,
+    existing: Option<(ContextServerId, String, HashMap<String, EnvValue>)>,
 ) -> String {
     let (name, url, headers) = match existing {
         Some((id, url, headers)) => {
@@ -293,12 +293,12 @@ fn context_server_http_input(
     )
 }
 
-fn parse_http_input(text: &str) -> Result<(ContextServerId, String, HashMap<String, String>)> {
+fn parse_http_input(text: &str) -> Result<(ContextServerId, String, HashMap<String, EnvValue>)> {
     #[derive(Deserialize)]
     struct Temp {
         url: String,
         #[serde(default)]
-        headers: HashMap<String, String>,
+        headers: HashMap<String, EnvValue>,
     }
     let value: HashMap<String, Temp> = serde_json_lenient::from_str(text)?;
     if value.len() != 1 {

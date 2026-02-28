@@ -30,6 +30,7 @@ use notifications::status_toast::{StatusToast, ToastIcon};
 use project::{
     agent_server_store::{AgentServerStore, ExternalAgentServerName, ExternalAgentSource},
     context_server_store::{ContextServerConfiguration, ContextServerStatus, ContextServerStore},
+    project_settings::ProjectSettings,
 };
 use settings::{Settings, SettingsStore, update_settings_file};
 use ui::{
@@ -624,13 +625,22 @@ impl AgentConfiguration {
 
         let is_running = matches!(server_status, ContextServerStatus::Running);
         let item_id = SharedString::from(context_server_id.0.clone());
-        // Servers without a configuration can only be provided by extensions.
-        let provided_by_extension = server_configuration.as_ref().is_none_or(|config| {
-            matches!(
-                config.as_ref(),
-                ContextServerConfiguration::Extension { .. }
-            )
-        });
+        let provided_by_extension = server_configuration.as_ref().map_or_else(
+            || {
+                matches!(
+                    ProjectSettings::get_global(cx)
+                        .context_servers
+                        .get(&context_server_id.0),
+                    Some(project::project_settings::ContextServerSettings::Extension { .. }) | None
+                )
+            },
+            |config| {
+                matches!(
+                    config.as_ref(),
+                    ContextServerConfiguration::Extension { .. }
+                )
+            },
+        );
 
         let error = if let ContextServerStatus::Error(error) = server_status.clone() {
             Some(error)

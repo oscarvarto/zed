@@ -17,7 +17,7 @@ use anyhow::Result;
 use client::Client;
 use gpui::AsyncApp;
 use parking_lot::RwLock;
-pub use settings::ContextServerCommand;
+pub use settings::{ContextServerCommand, EnvValue};
 use url::Url;
 
 use crate::transport::HttpTransport;
@@ -116,7 +116,17 @@ impl ContextServer {
                 client::ModelContextServerBinary {
                     executable: Path::new(&command.path).to_path_buf(),
                     args: command.args.clone(),
-                    env: command.env.clone(),
+                    env: command.env.as_ref().map(|env| {
+                        env.iter()
+                            .filter_map(|(k, v)| match v {
+                                EnvValue::Plain(s) => Some((k.clone(), s.clone())),
+                                EnvValue::Secret { .. } => {
+                                    log::error!("unresolved secret for env var '{k}'");
+                                    None
+                                }
+                            })
+                            .collect()
+                    }),
                     timeout: command.timeout,
                 },
                 working_directory,

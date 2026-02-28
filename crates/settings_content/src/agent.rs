@@ -5,9 +5,7 @@ use settings_macros::{MergeFrom, with_fallible_options};
 use std::sync::Arc;
 use std::{borrow::Cow, path::PathBuf};
 
-use crate::ExtendingVec;
-
-use crate::DockPosition;
+use crate::{DockPosition, EnvValue, ExtendingVec};
 
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
@@ -345,7 +343,7 @@ pub enum CustomAgentServerSettings {
         args: Vec<String>,
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        env: HashMap<String, String>,
+        env: HashMap<String, EnvValue>,
         /// The default mode to use for this agent.
         ///
         /// Note: Not only all agents support modes.
@@ -385,7 +383,7 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        env: HashMap<String, String>,
+        env: HashMap<String, EnvValue>,
         /// The default mode to use for this agent.
         ///
         /// Note: Not only all agents support modes.
@@ -425,7 +423,7 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        env: HashMap<String, String>,
+        env: HashMap<String, EnvValue>,
         /// The default mode to use for this agent.
         ///
         /// Note: Not only all agents support modes.
