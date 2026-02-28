@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Usage: script/protect-branch-file <file> [branch1 branch2 ...]
+#
+# Commits <file> to the current branch and prevents it from being merged
+# into the specified target branches (default: main) by using a custom
+# merge driver via .gitattributes.
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <file> [branch1 branch2 ...]" >&2
+    exit 1
+fi
+
+FILE="$1"
+shift
+BRANCHES=("${@:-main}")
+CURRENT_BRANCH=$(git branch --show-current)
+ATTR_LINE="${FILE} merge=ours"
+
+if [[ ! -f "$FILE" ]]; then
+    echo "Error: '$FILE' does not exist." >&2
+    exit 1
+fi
+
+# Configure the no-op merge driver (keeps the destination branch's version)
+git config merge.ours.driver true
+
+# Add the attribute to the current branch's .gitattributes
+if ! grep -qF "$ATTR_LINE" .gitattributes 2>/dev/null; then
+    echo "$ATTR_LINE" >> .gitattributes
+fi
+
+git add .gitattributes "$FILE"
+if ! git diff --cached --quiet; then
+    git commit -m "Track $FILE only in $CURRENT_BRANCH"
+fi
+
+# Update .gitattributes on each target branch using a temporary worktree
+# so we don't leave the current branch
+WORKTREE_BASE=$(mktemp -d)
+trap 'git worktree prune; rm -rf "$WORKTREE_BASE"' EXIT
+
+for BRANCH in "${BRANCHES[@]}"; do
+    WORKTREE_PATH="$WORKTREE_BASE/$BRANCH"
+    git worktree add --quiet "$WORKTREE_PATH" "$BRANCH"
+
+    if ! grep -qF "$ATTR_LINE" "$WORKTREE_PATH/.gitattributes" 2>/dev/null; then
+        echo "$ATTR_LINE" >> "$WORKTREE_PATH/.gitattributes"
+        git -C "$WORKTREE_PATH" add .gitattributes
+        git -C "$WORKTREE_PATH" commit -m "Prevent $FILE from being merged in from $CURRENT_BRANCH"
+        echo "Updated .gitattributes on '$BRANCH'."
+    else
+        echo "Branch '$BRANCH' already has the attribute for '$FILE', skipping."
+    fi
+
+    git worktree remove "$WORKTREE_PATH"
+done
+
+echo ""
+echo "Done. '$FILE' is committed to '$CURRENT_BRANCH' and protected from merging into: ${BRANCHES[*]}"
