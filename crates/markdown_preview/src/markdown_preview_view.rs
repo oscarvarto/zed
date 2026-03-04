@@ -19,7 +19,7 @@ use workspace::item::{Item, ItemHandle};
 use workspace::{Pane, Workspace};
 
 use crate::markdown_elements::ParsedMarkdownElement;
-use crate::markdown_renderer::{CheckboxClickedEvent, MermaidState};
+use crate::markdown_renderer::{CheckboxClickedEvent, MathState, MermaidState};
 use crate::{
     OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide, ScrollPageDown, ScrollPageUp,
     markdown_elements::ParsedMarkdown,
@@ -40,6 +40,7 @@ pub struct MarkdownPreviewView {
     list_state: ListState,
     language_registry: Arc<LanguageRegistry>,
     mermaid_state: MermaidState,
+    math_state: MathState,
     parsing_markdown_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
     _settings_subscription: Subscription,
@@ -217,6 +218,7 @@ impl MarkdownPreviewView {
                 list_state,
                 language_registry,
                 mermaid_state: Default::default(),
+                math_state: Default::default(),
                 parsing_markdown_task: None,
                 image_cache: RetainAllImageCache::new(cx),
                 mode,
@@ -365,6 +367,7 @@ impl MarkdownPreviewView {
 
             view.update(cx, move |view, cx| {
                 view.mermaid_state.update(&contents, cx);
+                view.math_state.update(&contents, cx);
                 let markdown_blocks_count = contents.children.len();
                 view.contents = Some(contents);
                 let scroll_top = view.list_state.logical_scroll_top();
@@ -561,6 +564,12 @@ impl Render for MarkdownPreviewView {
         let buffer_size = ThemeSettings::get_global(cx).buffer_font_size(cx);
         let buffer_line_height = ThemeSettings::get_global(cx).buffer_line_height;
 
+        if self.math_state.sync_render_style(cx) {
+            if let Some(contents) = self.contents.as_ref() {
+                self.math_state.update(contents, cx);
+            }
+        }
+
         v_flex()
             .image_cache(self.image_cache.clone())
             .id("MarkdownPreview")
@@ -589,6 +598,7 @@ impl Render for MarkdownPreviewView {
                             let mut render_cx = RenderContext::new(
                                 Some(this.workspace.clone()),
                                 &this.mermaid_state,
+                                &this.math_state,
                                 window,
                                 cx,
                             )

@@ -134,6 +134,7 @@ impl<'a> MarkdownParser<'a> {
             Event::Text(_)
             // Represent an inline code block
             | Event::Code(_)
+            | Event::InlineMath(_)
             | Event::Html(_)
             | Event::InlineHtml(_)
             | Event::FootnoteReference(_)
@@ -168,7 +169,13 @@ impl<'a> MarkdownParser<'a> {
                 Tag::Paragraph => {
                     self.cursor += 1;
                     let text = self.parse_text(false, Some(source_range));
-                    Some(vec![ParsedMarkdownElement::Paragraph(text)])
+                    if text.is_empty()
+                        && matches!(self.current_event(), Some(Event::DisplayMath(_)))
+                    {
+                        Some(Vec::new())
+                    } else {
+                        Some(vec![ParsedMarkdownElement::Paragraph(text)])
+                    }
                 }
                 Tag::Heading { level, .. } => {
                     let level = *level;
@@ -213,6 +220,9 @@ impl<'a> MarkdownParser<'a> {
                     if language.as_deref() == Some("mermaid") {
                         let mermaid_diagram = self.parse_mermaid_diagram(scale).await?;
                         Some(vec![ParsedMarkdownElement::MermaidDiagram(mermaid_diagram)])
+                    } else if Self::is_math_code_block_language(language.as_deref()) {
+                        let math_block = self.parse_display_math_code_block().await?;
+                        Some(vec![ParsedMarkdownElement::DisplayMath(math_block)])
                     } else {
                         let code_block = self.parse_code_block(language).await?;
                         Some(vec![ParsedMarkdownElement::CodeBlock(code_block)])
@@ -229,7 +239,56 @@ impl<'a> MarkdownParser<'a> {
                 self.cursor += 1;
                 Some(vec![ParsedMarkdownElement::HorizontalRule(source_range)])
             }
+            Event::DisplayMath(contents) => {
+                let contents = contents.to_string();
+                self.cursor += 1;
+                Some(vec![ParsedMarkdownElement::DisplayMath(Self::parsed_math(
+                    contents,
+                    ParsedMarkdownMathDisplayMode::Display,
+                    source_range,
+                    None,
+                ))])
+            }
             _ => None,
+        }
+    }
+
+    fn is_math_code_block_language(language: Option<&str>) -> bool {
+        matches!(language, Some("math" | "latex" | "tex"))
+    }
+
+    fn push_text_chunk(
+        markdown_chunks: &mut MarkdownParagraph,
+        text: &mut String,
+        highlights: &mut Vec<(Range<usize>, MarkdownHighlight)>,
+        regions: &mut Vec<(Range<usize>, ParsedRegion)>,
+        source_range: &Range<usize>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        markdown_chunks.push(MarkdownParagraphChunk::Text(ParsedMarkdownText {
+            source_range: source_range.clone(),
+            contents: mem::take(text).into(),
+            highlights: mem::take(highlights),
+            regions: mem::take(regions),
+        }));
+    }
+
+    fn parsed_math(
+        contents: impl Into<SharedString>,
+        display_mode: ParsedMarkdownMathDisplayMode,
+        source_range: Range<usize>,
+        link: Option<Link>,
+    ) -> ParsedMarkdownMath {
+        ParsedMarkdownMath {
+            source_range,
+            contents: ParsedMarkdownMathContents {
+                contents: contents.into(),
+                display_mode,
+            },
+            link,
         }
     }
 
@@ -261,7 +320,8 @@ impl<'a> MarkdownParser<'a> {
                 break;
             }
 
-            let (current, _) = self.current().unwrap();
+            let (current, current_source_range) = self.current().unwrap();
+            let current_source_range = current_source_range.clone();
             let prev_len = text.len();
             match current {
                 Event::SoftBreak => {
@@ -364,6 +424,21 @@ impl<'a> MarkdownParser<'a> {
                         }
                     }
                 }
+                Event::InlineMath(contents) => {
+                    Self::push_text_chunk(
+                        &mut markdown_text_like,
+                        &mut text,
+                        &mut highlights,
+                        &mut regions,
+                        &source_range,
+                    );
+                    markdown_text_like.push(MarkdownParagraphChunk::InlineMath(Self::parsed_math(
+                        contents.to_string(),
+                        ParsedMarkdownMathDisplayMode::Inline,
+                        current_source_range,
+                        link.clone(),
+                    )));
+                }
                 Event::Code(t) => {
                     text.push_str(t.as_ref());
                     let range = prev_len..text.len();
@@ -396,15 +471,13 @@ impl<'a> MarkdownParser<'a> {
                         );
                     }
                     Tag::Image { dest_url, .. } => {
-                        if !text.is_empty() {
-                            let parsed_regions = MarkdownParagraphChunk::Text(ParsedMarkdownText {
-                                source_range: source_range.clone(),
-                                contents: mem::take(&mut text).into(),
-                                highlights: mem::take(&mut highlights),
-                                regions: mem::take(&mut regions),
-                            });
-                            markdown_text_like.push(parsed_regions);
-                        }
+                        Self::push_text_chunk(
+                            &mut markdown_text_like,
+                            &mut text,
+                            &mut highlights,
+                            &mut regions,
+                            &source_range,
+                        );
                         image = Image::identify(
                             dest_url.to_string(),
                             source_range.clone(),
@@ -448,14 +521,13 @@ impl<'a> MarkdownParser<'a> {
 
             self.cursor += 1;
         }
-        if !text.is_empty() {
-            markdown_text_like.push(MarkdownParagraphChunk::Text(ParsedMarkdownText {
-                source_range,
-                contents: text.into(),
-                highlights,
-                regions,
-            }));
-        }
+        Self::push_text_chunk(
+            &mut markdown_text_like,
+            &mut text,
+            &mut highlights,
+            &mut regions,
+            &source_range,
+        );
         markdown_text_like
     }
 
@@ -756,10 +828,7 @@ impl<'a> MarkdownParser<'a> {
         }
     }
 
-    async fn parse_code_block(
-        &mut self,
-        language: Option<String>,
-    ) -> Option<ParsedMarkdownCodeBlock> {
+    fn parse_code_block_contents(&mut self) -> Option<(Range<usize>, String)> {
         let Some((_event, source_range)) = self.previous() else {
             return None;
         };
@@ -787,7 +856,17 @@ impl<'a> MarkdownParser<'a> {
             }
         }
 
-        code = code.strip_suffix('\n').unwrap_or(&code).to_string();
+        Some((
+            source_range,
+            code.strip_suffix('\n').unwrap_or(&code).to_string(),
+        ))
+    }
+
+    async fn parse_code_block(
+        &mut self,
+        language: Option<String>,
+    ) -> Option<ParsedMarkdownCodeBlock> {
+        let (source_range, code) = self.parse_code_block_contents()?;
 
         let highlights = if let Some(language) = &language {
             if let Some(registry) = &self.language_registry {
@@ -816,35 +895,7 @@ impl<'a> MarkdownParser<'a> {
         &mut self,
         scale: Option<u32>,
     ) -> Option<ParsedMarkdownMermaidDiagram> {
-        let Some((_event, source_range)) = self.previous() else {
-            return None;
-        };
-
-        let source_range = source_range.clone();
-        let mut code = String::new();
-
-        while !self.eof() {
-            let Some((current, _source_range)) = self.current() else {
-                break;
-            };
-
-            match current {
-                Event::Text(text) => {
-                    code.push_str(text);
-                    self.cursor += 1;
-                }
-                Event::End(TagEnd::CodeBlock) => {
-                    self.cursor += 1;
-                    break;
-                }
-                _ => {
-                    break;
-                }
-            }
-        }
-
-        code = code.strip_suffix('\n').unwrap_or(&code).to_string();
-
+        let (source_range, code) = self.parse_code_block_contents()?;
         let scale = scale.unwrap_or(100).clamp(10, 500);
 
         Some(ParsedMarkdownMermaidDiagram {
@@ -854,6 +905,16 @@ impl<'a> MarkdownParser<'a> {
                 scale,
             },
         })
+    }
+
+    async fn parse_display_math_code_block(&mut self) -> Option<ParsedMarkdownMath> {
+        let (source_range, code) = self.parse_code_block_contents()?;
+        Some(Self::parsed_math(
+            code,
+            ParsedMarkdownMathDisplayMode::Display,
+            source_range,
+            None,
+        ))
     }
 
     async fn parse_html_block(&mut self) -> Vec<ParsedMarkdownElement> {
@@ -3144,6 +3205,88 @@ fn main() {
                 0..39,
                 Some(vec![])
             )]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_inline_math() {
+        let parsed = parse("This costs $x + y$ dollars.").await;
+
+        assert_eq!(parsed.children.len(), 1);
+        let ParsedMarkdownElement::Paragraph(chunks) = &parsed.children[0] else {
+            panic!("Expected a paragraph");
+        };
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks[0],
+            MarkdownParagraphChunk::Text(ParsedMarkdownText {
+                source_range: 0..27,
+                contents: "This costs ".into(),
+                highlights: Vec::new(),
+                regions: Vec::new(),
+            })
+        );
+        assert_eq!(
+            chunks[1],
+            MarkdownParagraphChunk::InlineMath(ParsedMarkdownMath {
+                source_range: 11..18,
+                contents: ParsedMarkdownMathContents {
+                    contents: "x + y".into(),
+                    display_mode: ParsedMarkdownMathDisplayMode::Inline,
+                },
+                link: None,
+            })
+        );
+        assert_eq!(
+            chunks[2],
+            MarkdownParagraphChunk::Text(ParsedMarkdownText {
+                source_range: 0..27,
+                contents: " dollars.".into(),
+                highlights: Vec::new(),
+                regions: Vec::new(),
+            })
+        );
+    }
+
+    #[gpui::test]
+    async fn test_display_math() {
+        let parsed = parse("$$x + y$$").await;
+
+        assert_eq!(
+            parsed.children,
+            vec![ParsedMarkdownElement::DisplayMath(ParsedMarkdownMath {
+                source_range: 0..9,
+                contents: ParsedMarkdownMathContents {
+                    contents: "x + y".into(),
+                    display_mode: ParsedMarkdownMathDisplayMode::Display,
+                },
+                link: None,
+            })]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_math_code_block() {
+        let parsed = parse(
+            "\
+```math
+\\int_0^1 x^2 dx
+```
+",
+        )
+        .await;
+
+        assert_eq!(
+            parsed.children,
+            vec![ParsedMarkdownElement::DisplayMath(ParsedMarkdownMath {
+                source_range: 0..27,
+                contents: ParsedMarkdownMathContents {
+                    contents: "\\int_0^1 x^2 dx".into(),
+                    display_mode: ParsedMarkdownMathDisplayMode::Display,
+                },
+                link: None,
+            })]
         );
     }
 

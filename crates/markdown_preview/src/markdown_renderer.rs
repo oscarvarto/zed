@@ -4,6 +4,7 @@ use crate::{
         HeadingLevel, Image, Link, MarkdownParagraph, MarkdownParagraphChunk, ParsedMarkdown,
         ParsedMarkdownBlockQuote, ParsedMarkdownCodeBlock, ParsedMarkdownElement,
         ParsedMarkdownHeading, ParsedMarkdownListItem, ParsedMarkdownListItemType,
+        ParsedMarkdownMath, ParsedMarkdownMathContents, ParsedMarkdownMathDisplayMode,
         ParsedMarkdownMermaidDiagram, ParsedMarkdownMermaidDiagramContents, ParsedMarkdownTable,
         ParsedMarkdownTableAlignment, ParsedMarkdownTableRow,
     },
@@ -21,13 +22,15 @@ use gpui::{
 use settings::Settings;
 use std::{
     ops::{Mul, Range},
-    sync::{Arc, OnceLock},
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, LazyLock, OnceLock},
     time::Duration,
     vec,
 };
 use tempfile::tempdir;
 use theme::{ActiveTheme, SyntaxTheme, ThemeSettings};
 use ui::{CopyButton, LinkPreview, ToggleState, prelude::*, tooltip_container};
+use util::ResultExt as _;
 use workspace::{OpenOptions, OpenVisible, Workspace};
 
 pub struct CheckboxClickedEvent {
@@ -48,6 +51,7 @@ impl CheckboxClickedEvent {
 type CheckboxClickedCallback = Arc<Box<dyn Fn(&CheckboxClickedEvent, &mut Window, &mut App)>>;
 
 type MermaidDiagramCache = HashMap<ParsedMarkdownMermaidDiagramContents, CachedMermaidDiagram>;
+type MathFormulaCache = HashMap<ParsedMarkdownMathContents, CachedMathFormula>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum MermaidRendererBackend {
@@ -159,6 +163,110 @@ impl MermaidState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MathRenderStyle {
+    font_size_millipoints: u32,
+    text_color_rgb: u32,
+}
+
+impl MathRenderStyle {
+    fn from_app(cx: &App) -> Self {
+        let font_size_pixels: f32 = ThemeSettings::get_global(cx).buffer_font_size(cx).into();
+        let font_size_points = font_size_pixels * 72.0 / 96.0;
+        let rgba = cx.theme().colors().text.to_rgb();
+        let red = (rgba.r * 255.0).round().clamp(0.0, 255.0) as u32;
+        let green = (rgba.g * 255.0).round().clamp(0.0, 255.0) as u32;
+        let blue = (rgba.b * 255.0).round().clamp(0.0, 255.0) as u32;
+
+        Self {
+            font_size_millipoints: (font_size_points * 1000.0).round().max(1.0) as u32,
+            text_color_rgb: (red << 16) | (green << 8) | blue,
+        }
+    }
+
+    fn font_size_points(self) -> f32 {
+        self.font_size_millipoints as f32 / 1000.0
+    }
+
+    fn text_color_hex(self) -> String {
+        format!("#{:06x}", self.text_color_rgb)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct MathState {
+    cache: MathFormulaCache,
+    order: Vec<ParsedMarkdownMathContents>,
+    render_style: MathRenderStyle,
+}
+
+impl MathState {
+    fn get_fallback_image(
+        idx: usize,
+        old_order: &[ParsedMarkdownMathContents],
+        new_order_len: usize,
+        cache: &MathFormulaCache,
+    ) -> Option<Arc<RenderImage>> {
+        if old_order.len() != new_order_len {
+            return None;
+        }
+
+        old_order.get(idx).and_then(|old_content| {
+            cache.get(old_content).and_then(|old_cached| {
+                old_cached
+                    .render_image
+                    .get()
+                    .and_then(|result| result.as_ref().ok().cloned())
+                    .or_else(|| old_cached.fallback_image.clone())
+            })
+        })
+    }
+
+    fn set_render_style(&mut self, render_style: MathRenderStyle) -> bool {
+        if self.render_style == render_style {
+            return false;
+        }
+
+        self.cache.clear();
+        self.order.clear();
+        self.render_style = render_style;
+        true
+    }
+
+    pub(crate) fn sync_render_style(&mut self, cx: &App) -> bool {
+        self.set_render_style(MathRenderStyle::from_app(cx))
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        parsed: &ParsedMarkdown,
+        cx: &mut Context<MarkdownPreviewView>,
+    ) {
+        use std::collections::HashSet;
+
+        self.sync_render_style(cx);
+
+        let mut new_order = Vec::new();
+        collect_math_contents(parsed, &mut new_order);
+
+        for (idx, new_content) in new_order.iter().enumerate() {
+            if !self.cache.contains_key(new_content) {
+                let fallback =
+                    Self::get_fallback_image(idx, &self.order, new_order.len(), &self.cache);
+                self.cache.insert(
+                    new_content.clone(),
+                    CachedMathFormula::new(new_content.clone(), fallback, self.render_style, cx),
+                );
+            }
+        }
+
+        let new_order_set: HashSet<_> = new_order.iter().cloned().collect();
+        self.cache
+            .retain(|content, _| new_order_set.contains(content));
+        self.order = new_order;
+    }
+}
+
 pub(crate) struct CachedMermaidDiagram {
     pub(crate) render_image: Arc<OnceLock<anyhow::Result<Arc<RenderImage>>>>,
     pub(crate) fallback_image: Option<Arc<RenderImage>>,
@@ -206,6 +314,62 @@ impl CachedMermaidDiagram {
         let result = Arc::new(OnceLock::new());
         if let Some(img) = render_image {
             assert!(result.set(Ok(img)).is_ok());
+        }
+        Self {
+            render_image: result,
+            fallback_image,
+            _task: Task::ready(()),
+        }
+    }
+}
+
+pub(crate) struct CachedMathFormula {
+    pub(crate) render_image: Arc<OnceLock<anyhow::Result<Arc<RenderImage>>>>,
+    pub(crate) fallback_image: Option<Arc<RenderImage>>,
+    _task: Task<()>,
+}
+
+impl CachedMathFormula {
+    fn new(
+        contents: ParsedMarkdownMathContents,
+        fallback_image: Option<Arc<RenderImage>>,
+        render_style: MathRenderStyle,
+        cx: &mut Context<MarkdownPreviewView>,
+    ) -> Self {
+        let result = Arc::new(OnceLock::<anyhow::Result<Arc<RenderImage>>>::new());
+        let result_clone = result.clone();
+        let svg_renderer = cx.svg_renderer();
+
+        let _task = cx.spawn(async move |this, cx| {
+            let value = cx
+                .background_spawn(async move {
+                    render_math_formula_image(&contents, render_style, &svg_renderer)
+                })
+                .await;
+            if result_clone.set(value).is_err() {
+                log::error!("math render result was set more than once");
+            }
+            this.update(cx, |_, cx| {
+                cx.notify();
+            })
+            .ok();
+        });
+
+        Self {
+            render_image: result,
+            fallback_image,
+            _task,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        render_image: Option<Arc<RenderImage>>,
+        fallback_image: Option<Arc<RenderImage>>,
+    ) -> Self {
+        let result = Arc::new(OnceLock::new());
+        if let Some(image) = render_image {
+            assert!(result.set(Ok(image)).is_ok());
         }
         Self {
             render_image: result,
@@ -289,6 +453,296 @@ async fn render_mermaid_with_external_mmdc(
     })
 }
 
+fn collect_math_contents(parsed: &ParsedMarkdown, contents: &mut Vec<ParsedMarkdownMathContents>) {
+    for child in &parsed.children {
+        collect_math_contents_from_element(child, contents);
+    }
+}
+
+fn collect_math_contents_from_element(
+    element: &ParsedMarkdownElement,
+    contents: &mut Vec<ParsedMarkdownMathContents>,
+) {
+    match element {
+        ParsedMarkdownElement::Heading(heading) => {
+            collect_math_contents_from_chunks(&heading.contents, contents);
+        }
+        ParsedMarkdownElement::ListItem(list_item) => {
+            for child in &list_item.content {
+                collect_math_contents_from_element(child, contents);
+            }
+        }
+        ParsedMarkdownElement::Table(table) => {
+            for row in table.header.iter().chain(table.body.iter()) {
+                for column in &row.columns {
+                    collect_math_contents_from_chunks(&column.children, contents);
+                }
+            }
+
+            if let Some(caption) = table.caption.as_ref() {
+                collect_math_contents_from_chunks(caption, contents);
+            }
+        }
+        ParsedMarkdownElement::BlockQuote(block_quote) => {
+            for child in &block_quote.children {
+                collect_math_contents_from_element(child, contents);
+            }
+        }
+        ParsedMarkdownElement::DisplayMath(math) => contents.push(math.contents.clone()),
+        ParsedMarkdownElement::Paragraph(paragraph) => {
+            collect_math_contents_from_chunks(paragraph, contents);
+        }
+        ParsedMarkdownElement::CodeBlock(_)
+        | ParsedMarkdownElement::MermaidDiagram(_)
+        | ParsedMarkdownElement::HorizontalRule(_)
+        | ParsedMarkdownElement::Image(_) => {}
+    }
+}
+
+fn collect_math_contents_from_chunks(
+    paragraph: &MarkdownParagraph,
+    contents: &mut Vec<ParsedMarkdownMathContents>,
+) {
+    for chunk in paragraph {
+        if let MarkdownParagraphChunk::InlineMath(math) = chunk {
+            contents.push(math.contents.clone());
+        }
+    }
+}
+
+fn render_math_formula_image(
+    contents: &ParsedMarkdownMathContents,
+    render_style: MathRenderStyle,
+    svg_renderer: &gpui::SvgRenderer,
+) -> anyhow::Result<Arc<RenderImage>> {
+    let svg = render_math_formula_svg(contents, render_style)?;
+    svg_renderer
+        .render_single_frame(svg.as_bytes(), 1.0, true)
+        .map_err(|error| anyhow::anyhow!("{}", error))
+}
+
+fn render_math_formula_svg(
+    contents: &ParsedMarkdownMathContents,
+    render_style: MathRenderStyle,
+) -> anyhow::Result<String> {
+    catch_unwind(AssertUnwindSafe(|| {
+        render_math_formula_svg_inner(contents, render_style)
+    }))
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("math rendering panicked")))
+}
+
+fn render_math_formula_svg_inner(
+    contents: &ParsedMarkdownMathContents,
+    render_style: MathRenderStyle,
+) -> anyhow::Result<String> {
+    let typst_math = mitex::convert_math(contents.contents.as_ref(), None)
+        .map_err(|error| anyhow::anyhow!("failed to convert LaTeX math with mitex: {error}"))?;
+    let typst_source = format!(
+        "{MATH_TYPST_PREAMBLE}{}{formula}",
+        math_typst_page_setup(contents.display_mode, render_style),
+        formula = math_typst_formula_body(contents.display_mode, &typst_math),
+    );
+
+    compile_math_typst_to_svg(&typst_source)
+}
+
+fn math_typst_page_setup(
+    display_mode: ParsedMarkdownMathDisplayMode,
+    render_style: MathRenderStyle,
+) -> String {
+    let margin_points = match display_mode {
+        ParsedMarkdownMathDisplayMode::Inline => 0.0,
+        ParsedMarkdownMathDisplayMode::Display => 4.0,
+    };
+
+    format!(
+        "#set page(width: auto, height: auto, margin: {margin_points:.3}pt, fill: none)\n\
+         #set text(size: {:.3}pt, fill: rgb(\"{}\"))\n",
+        render_style.font_size_points(),
+        render_style.text_color_hex(),
+    )
+}
+
+fn math_typst_formula_body(
+    display_mode: ParsedMarkdownMathDisplayMode,
+    typst_math: &str,
+) -> String {
+    match display_mode {
+        ParsedMarkdownMathDisplayMode::Inline => format!("${typst_math}$"),
+        ParsedMarkdownMathDisplayMode::Display => format!("$ {typst_math} $"),
+    }
+}
+
+fn compile_math_typst_to_svg(source: &str) -> anyhow::Result<String> {
+    use typst::layout::PagedDocument;
+
+    let world = MathWorld::new(source);
+    let warned = typst::compile::<PagedDocument>(&world);
+    let document = warned.output.map_err(|diagnostics| {
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::anyhow!("failed to compile Typst math document: {messages}")
+    })?;
+
+    let page = document
+        .pages
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("Typst did not produce a page for the math expression"))?;
+
+    Ok(typst_svg::svg(page))
+}
+
+struct CachedMathFonts {
+    book: typst::utils::LazyHash<typst::text::FontBook>,
+    fonts: Vec<typst::text::Font>,
+}
+
+fn cached_math_fonts() -> &'static CachedMathFonts {
+    static FONTS: LazyLock<CachedMathFonts> = LazyLock::new(|| {
+        let mut book = typst::text::FontBook::new();
+        let mut fonts = Vec::new();
+
+        for data in typst_assets::fonts() {
+            let bytes = typst::foundations::Bytes::new(data);
+            for font in typst::text::Font::iter(bytes) {
+                book.push(font.info().clone());
+                fonts.push(font);
+            }
+        }
+
+        CachedMathFonts {
+            book: typst::utils::LazyHash::new(book),
+            fonts,
+        }
+    });
+
+    &FONTS
+}
+
+fn cached_math_library() -> &'static typst::utils::LazyHash<typst::Library> {
+    static LIBRARY: LazyLock<typst::utils::LazyHash<typst::Library>> = LazyLock::new(|| {
+        use typst::LibraryExt;
+
+        typst::utils::LazyHash::new(typst::Library::default())
+    });
+
+    &LIBRARY
+}
+
+struct MathWorld {
+    source: typst::syntax::Source,
+}
+
+impl MathWorld {
+    fn new(source_text: &str) -> Self {
+        Self {
+            source: typst::syntax::Source::detached(source_text),
+        }
+    }
+}
+
+impl typst::World for MathWorld {
+    fn library(&self) -> &typst::utils::LazyHash<typst::Library> {
+        cached_math_library()
+    }
+
+    fn book(&self) -> &typst::utils::LazyHash<typst::text::FontBook> {
+        &cached_math_fonts().book
+    }
+
+    fn main(&self) -> typst::syntax::FileId {
+        self.source.id()
+    }
+
+    fn source(&self, id: typst::syntax::FileId) -> typst::diag::FileResult<typst::syntax::Source> {
+        if id == self.source.id() {
+            Ok(self.source.clone())
+        } else {
+            Err(typst::diag::FileError::AccessDenied)
+        }
+    }
+
+    fn file(
+        &self,
+        _id: typst::syntax::FileId,
+    ) -> typst::diag::FileResult<typst::foundations::Bytes> {
+        Err(typst::diag::FileError::AccessDenied)
+    }
+
+    fn font(&self, index: usize) -> Option<typst::text::Font> {
+        cached_math_fonts().fonts.get(index).cloned()
+    }
+
+    fn today(&self, _offset: Option<i64>) -> Option<typst::foundations::Datetime> {
+        None
+    }
+}
+
+const MATH_TYPST_PREAMBLE: &str = "\
+#let textmath(it) = it\n\
+#let textbf(it) = math.bold(it)\n\
+#let textit(it) = math.italic(it)\n\
+#let textmd(it) = it\n\
+#let textnormal(it) = it\n\
+#let textrm(it) = math.upright(it)\n\
+#let textsf(it) = math.sans(it)\n\
+#let texttt(it) = math.mono(it)\n\
+#let textup(it) = math.upright(it)\n\
+#let mitexmathbf(it) = math.bold(math.upright(it))\n\
+#let mitexbold(it) = math.bold(math.upright(it))\n\
+#let mitexupright(it) = math.upright(it)\n\
+#let mitexitalic(it) = math.italic(it)\n\
+#let mitexsans(it) = math.sans(it)\n\
+#let mitexfrak(it) = math.frak(it)\n\
+#let mitexmono(it) = math.mono(it)\n\
+#let mitexcal(it) = math.cal(it)\n\
+#let mitexdisplay(it) = math.display(it)\n\
+#let mitexinline(it) = math.inline(it)\n\
+#let mitexscript(it) = math.script(it)\n\
+#let mitexsscript(it) = math.sscript(it)\n\
+#let mitexsqrt(..args) = {\n\
+  let positional_args = args.pos()\n\
+  if positional_args.len() == 2 { math.root(positional_args.at(0), positional_args.at(1)) }\n\
+  else if positional_args.len() > 0 { math.sqrt(positional_args.at(0)) }\n\
+}\n\
+#let pmatrix(..args) = math.mat(delim: \"(\", ..args)\n\
+#let bmatrix(..args) = math.mat(delim: \"[\", ..args)\n\
+#let Bmatrix(..args) = math.mat(delim: \"{\", ..args)\n\
+#let vmatrix(..args) = math.mat(delim: \"|\", ..args)\n\
+#let Vmatrix(..args) = math.mat(delim: \"||\", ..args)\n\
+#let mitexarray(..args) = math.mat(..args)\n\
+#let aligned(..args) = math.display(math.mat(delim: none, ..args))\n\
+#let alignedat(..args) = math.display(math.mat(delim: none, ..args))\n\
+#let rcases(..args) = math.cases(reverse: true, ..args)\n\
+#let big(it) = math.lr(size: 1.2em, it)\n\
+#let bigg(it) = math.lr(size: 2.4em, it)\n\
+#let Big(it) = math.lr(size: 1.8em, it)\n\
+#let Bigg(it) = math.lr(size: 3em, it)\n\
+#let mitexoverbrace(..args) = math.overbrace(..args)\n\
+#let mitexunderbrace(..args) = math.underbrace(..args)\n\
+#let mitexoverbracket(..args) = math.overbracket(..args)\n\
+#let mitexunderbracket(..args) = math.underbracket(..args)\n\
+#let mitexcolor(it) = it\n\
+#let colortext(..args) = {\n\
+  let positional_args = args.pos()\n\
+  if positional_args.len() >= 2 { positional_args.at(1) } else if positional_args.len() >= 1 { positional_args.at(0) }\n\
+}\n\
+#let operatornamewithlimits(it) = math.op(it, limits: true)\n\
+#let atop(num, den) = math.frac(num, den)\n\
+#let mitexcite(it) = it\n\
+#let mitexref(it) = it\n\
+#let mitexlabel(it) = none\n\
+#let mitexcaption(it) = it\n\
+#let miteximage(..args) = none\n\
+#let bottomrule = none\n\
+#let midrule = none\n\
+#let toprule = none\n\
+#let brace(it) = math.lr(size: auto, [{] + it + [}])\n\
+#let brack(it) = math.lr(size: auto, $[$ + it + $]$)\n";
+
 #[derive(Clone)]
 pub struct RenderContext<'a> {
     workspace: Option<WeakEntity<Workspace>>,
@@ -310,12 +764,14 @@ pub struct RenderContext<'a> {
     checkbox_clicked_callback: Option<CheckboxClickedCallback>,
     is_last_child: bool,
     mermaid_state: &'a MermaidState,
+    math_state: &'a MathState,
 }
 
 impl<'a> RenderContext<'a> {
     pub(crate) fn new(
         workspace: Option<WeakEntity<Workspace>>,
         mermaid_state: &'a MermaidState,
+        math_state: &'a MathState,
         window: &mut Window,
         cx: &mut App,
     ) -> Self {
@@ -349,6 +805,7 @@ impl<'a> RenderContext<'a> {
             checkbox_clicked_callback: None,
             is_last_child: false,
             mermaid_state,
+            math_state,
         }
     }
 
@@ -417,8 +874,9 @@ pub fn render_parsed_markdown(
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
-    let cache = Default::default();
-    let mut cx = RenderContext::new(workspace, &cache, window, cx);
+    let mermaid_state = Default::default();
+    let math_state = Default::default();
+    let mut cx = RenderContext::new(workspace, &mermaid_state, &math_state, window, cx);
 
     v_flex().gap_3().children(
         parsed
@@ -437,6 +895,7 @@ pub fn render_markdown_block(block: &ParsedMarkdownElement, cx: &mut RenderConte
         BlockQuote(block_quote) => render_markdown_block_quote(block_quote, cx),
         CodeBlock(code_block) => render_markdown_code_block(code_block, cx),
         MermaidDiagram(mermaid) => render_mermaid_diagram(mermaid, cx),
+        DisplayMath(math) => render_display_math(math, cx),
         HorizontalRule(_) => render_markdown_rule(cx),
         Image(image) => render_markdown_image(image, cx),
     }
@@ -476,7 +935,7 @@ fn render_markdown_heading(parsed: &ParsedMarkdownHeading, cx: &mut RenderContex
         .text_color(color)
         .pt(padding_top)
         .pb(padding_bottom)
-        .children(render_markdown_text(&parsed.contents, cx))
+        .child(render_inline_markdown(&parsed.contents, cx))
         .whitespace_normal()
         .into_any()
 }
@@ -769,7 +1228,7 @@ fn render_markdown_table(parsed: &ParsedMarkdownTable, cx: &mut RenderContext) -
             let cell_element = container
                 .col_span(cell.col_span.min(max_column_count - col_idx) as u16)
                 .row_span(cell.row_span.min(total_rows - row_idx) as u16)
-                .children(render_markdown_text(&cell.children, cx))
+                .child(render_inline_markdown(&cell.children, cx))
                 .px_2()
                 .py_1()
                 .when(col_idx > 0, |this| this.border_l_1())
@@ -815,7 +1274,7 @@ fn render_markdown_table(parsed: &ParsedMarkdownTable, cx: &mut RenderContext) -
 
     cx.with_common_p(v_flex().items_start())
         .when_some(parsed.caption.as_ref(), |this, caption| {
-            this.children(render_markdown_text(caption, cx))
+            this.child(render_inline_markdown(caption, cx))
         })
         .border_1()
         .border_color(cx.border_color)
@@ -992,10 +1451,136 @@ fn render_mermaid_diagram(
 
 fn render_markdown_paragraph(parsed: &MarkdownParagraph, cx: &mut RenderContext) -> AnyElement {
     cx.with_common_p(div())
-        .children(render_markdown_text(parsed, cx))
-        .flex()
-        .flex_col()
+        .child(render_inline_markdown(parsed, cx))
         .into_any_element()
+}
+
+fn render_inline_markdown(parsed: &MarkdownParagraph, cx: &mut RenderContext) -> AnyElement {
+    let container = div().children(render_markdown_text(parsed, cx));
+    if parsed
+        .iter()
+        .any(|chunk| !matches!(chunk, MarkdownParagraphChunk::Text(_)))
+    {
+        container
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_baseline()
+            .into_any_element()
+    } else {
+        container.into_any_element()
+    }
+}
+
+fn render_display_math(parsed: &ParsedMarkdownMath, cx: &mut RenderContext) -> AnyElement {
+    let cached = cx.math_state.cache.get(&parsed.contents);
+    let body =
+        if let Some(result) = cached.and_then(|cached_formula| cached_formula.render_image.get()) {
+            match result {
+                Ok(render_image) => div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        img(ImageSource::Render(render_image.clone()))
+                            .max_w_full()
+                            .with_fallback(|| {
+                                div()
+                                    .child(Label::new("Failed to load math expression"))
+                                    .into_any_element()
+                            }),
+                    )
+                    .into_any_element(),
+                Err(_) => div()
+                    .w_full()
+                    .child(StyledText::new(math_fallback_text(&parsed.contents)))
+                    .into_any_element(),
+            }
+        } else if let Some(fallback) =
+            cached.and_then(|cached_formula| cached_formula.fallback_image.as_ref())
+        {
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(
+                    img(ImageSource::Render(fallback.clone()))
+                        .max_w_full()
+                        .with_fallback(|| {
+                            div()
+                                .child(Label::new("Failed to load math expression"))
+                                .into_any_element()
+                        }),
+                )
+                .with_animation(
+                    "math-display-fallback-pulse",
+                    Animation::new(Duration::from_secs(2))
+                        .repeat()
+                        .with_easing(pulsating_between(0.6, 1.0)),
+                    |element, delta| element.opacity(delta),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(
+                    Label::new("Rendering math...")
+                        .color(Color::Muted)
+                        .with_animation(
+                            "math-display-loading-pulse",
+                            Animation::new(Duration::from_secs(2))
+                                .repeat()
+                                .with_easing(pulsating_between(0.4, 0.8)),
+                            |label, delta| label.alpha(delta),
+                        ),
+                )
+                .into_any_element()
+        };
+
+    cx.with_common_p(div())
+        .py(cx.scaled_rems(0.5))
+        .child(body)
+        .into_any_element()
+}
+
+fn math_fallback_text(contents: &ParsedMarkdownMathContents) -> SharedString {
+    match contents.display_mode {
+        ParsedMarkdownMathDisplayMode::Inline => format!("${}$", contents.contents).into(),
+        ParsedMarkdownMathDisplayMode::Display => format!("$$ {} $$", contents.contents).into(),
+    }
+}
+
+fn open_markdown_link(
+    link: &Link,
+    workspace: &Option<WeakEntity<Workspace>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match link {
+        Link::Web { url } => cx.open_url(url),
+        Link::Path { path, .. } => {
+            if let Some(workspace) = workspace {
+                let normalized_path = normalize_path(path.clone().as_path());
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace
+                            .open_abs_path(
+                                normalized_path,
+                                OpenOptions {
+                                    visible: Some(OpenVisible::None),
+                                    ..Default::default()
+                                },
+                                window,
+                                cx,
+                            )
+                            .detach();
+                    })
+                    .log_err();
+            }
+        }
+    }
 }
 
 fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) -> Vec<AnyElement> {
@@ -1070,29 +1655,95 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
                         })
                         .on_click(
                             link_ranges,
-                            move |clicked_range_ix, window, cx| match &links[clicked_range_ix] {
-                                Link::Web { url } => cx.open_url(url),
-                                Link::Path { path, .. } => {
-                                    if let Some(workspace) = &workspace {
-                                        _ = workspace.update(cx, |workspace, cx| {
-                                            workspace
-                                                .open_abs_path(
-                                                    normalize_path(path.clone().as_path()),
-                                                    OpenOptions {
-                                                        visible: Some(OpenVisible::None),
-                                                        ..Default::default()
-                                                    },
-                                                    window,
-                                                    cx,
-                                                )
-                                                .detach();
-                                        });
-                                    }
-                                }
+                            move |clicked_range_ix, window, cx| {
+                                open_markdown_link(&links[clicked_range_ix], &workspace, window, cx)
                             },
                         ),
                     )
                     .into_any();
+                any_element.push(element);
+            }
+
+            MarkdownParagraphChunk::InlineMath(math) => {
+                let math_body = {
+                    let cached = cx.math_state.cache.get(&math.contents);
+                    if let Some(result) =
+                        cached.and_then(|cached_formula| cached_formula.render_image.get())
+                    {
+                        match result {
+                            Ok(render_image) => img(ImageSource::Render(render_image.clone()))
+                                .with_fallback({
+                                    let fallback_text = math_fallback_text(&math.contents);
+                                    move || {
+                                        div()
+                                            .child(StyledText::new(fallback_text.clone()))
+                                            .into_any_element()
+                                    }
+                                })
+                                .into_any_element(),
+                            Err(_) => div()
+                                .child(StyledText::new(math_fallback_text(&math.contents)))
+                                .into_any_element(),
+                        }
+                    } else if let Some(fallback) =
+                        cached.and_then(|cached_formula| cached_formula.fallback_image.as_ref())
+                    {
+                        img(ImageSource::Render(fallback.clone()))
+                            .with_fallback({
+                                let fallback_text = math_fallback_text(&math.contents);
+                                move || {
+                                    div()
+                                        .child(StyledText::new(fallback_text.clone()))
+                                        .into_any_element()
+                                }
+                            })
+                            .with_animation(
+                                "math-inline-fallback-pulse",
+                                Animation::new(Duration::from_secs(2))
+                                    .repeat()
+                                    .with_easing(pulsating_between(0.6, 1.0)),
+                                |element, delta| element.opacity(delta),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .child(
+                                Label::new(math_fallback_text(&math.contents))
+                                    .color(Color::Muted)
+                                    .with_animation(
+                                        "math-inline-loading-pulse",
+                                        Animation::new(Duration::from_secs(2))
+                                            .repeat()
+                                            .with_easing(pulsating_between(0.4, 0.8)),
+                                        |label, delta| label.alpha(delta),
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                };
+
+                let workspace = workspace_clone.clone();
+                let element_id = cx.next_id(&math.source_range);
+                let element = div()
+                    .id(element_id)
+                    .when(math.link.is_some(), |element| element.cursor_pointer())
+                    .when_some(math.link.clone(), |element, link| {
+                        element.tooltip(move |_, cx| {
+                            InteractiveMarkdownElementTooltip::new(
+                                Some(link.to_string().into()),
+                                "open link",
+                                cx,
+                            )
+                            .into()
+                        })
+                    })
+                    .when_some(math.link.clone(), |element, link| {
+                        element.on_click(move |_, window, cx| {
+                            open_markdown_link(&link, &workspace, window, cx)
+                        })
+                    })
+                    .child(math_body)
+                    .into_any_element();
                 any_element.push(element);
             }
 
@@ -1422,10 +2073,29 @@ mod tests {
         }
     }
 
+    fn math_contents(
+        contents: &str,
+        display_mode: ParsedMarkdownMathDisplayMode,
+    ) -> ParsedMarkdownMathContents {
+        ParsedMarkdownMathContents {
+            contents: SharedString::from(contents.to_string()),
+            display_mode,
+        }
+    }
+
     fn mermaid_sequence(diagrams: &[&str]) -> Vec<ParsedMarkdownMermaidDiagramContents> {
         diagrams
             .iter()
             .map(|diagram| mermaid_contents(diagram))
+            .collect()
+    }
+
+    fn math_sequence(
+        formulas: &[(&str, ParsedMarkdownMathDisplayMode)],
+    ) -> Vec<ParsedMarkdownMathContents> {
+        formulas
+            .iter()
+            .map(|(formula, display_mode)| math_contents(formula, *display_mode))
             .collect()
     }
 
@@ -1461,6 +2131,105 @@ mod tests {
         assert!(state.set_renderer_backend(MermaidRendererBackend::ExternalMmdc));
         assert!(state.cache.is_empty());
         assert!(state.order.is_empty());
+    }
+
+    #[test]
+    fn test_math_cache_is_cleared_when_render_style_changes() {
+        let mut state = MathState {
+            cache: HashMap::default(),
+            order: math_sequence(&[("x^2", ParsedMarkdownMathDisplayMode::Inline)]),
+            render_style: MathRenderStyle {
+                font_size_millipoints: 12000,
+                text_color_rgb: 0xffffff,
+            },
+        };
+        state.cache.insert(
+            math_contents("x^2", ParsedMarkdownMathDisplayMode::Inline),
+            CachedMathFormula::new_for_test(Some(mock_render_image()), None),
+        );
+
+        assert!(state.set_render_style(MathRenderStyle {
+            font_size_millipoints: 14000,
+            text_color_rgb: 0xffffff,
+        }));
+        assert!(state.cache.is_empty());
+        assert!(state.order.is_empty());
+    }
+
+    #[test]
+    fn test_math_fallback_on_edit() {
+        let old_full_order = math_sequence(&[
+            ("x", ParsedMarkdownMathDisplayMode::Inline),
+            ("x^2", ParsedMarkdownMathDisplayMode::Display),
+            ("y", ParsedMarkdownMathDisplayMode::Inline),
+        ]);
+        let new_full_order = math_sequence(&[
+            ("x", ParsedMarkdownMathDisplayMode::Inline),
+            ("x^3", ParsedMarkdownMathDisplayMode::Display),
+            ("y", ParsedMarkdownMathDisplayMode::Inline),
+        ]);
+
+        let svg = mock_render_image();
+        let mut cache: MathFormulaCache = HashMap::default();
+        cache.insert(
+            math_contents("x", ParsedMarkdownMathDisplayMode::Inline),
+            CachedMathFormula::new_for_test(Some(mock_render_image()), None),
+        );
+        cache.insert(
+            math_contents("x^2", ParsedMarkdownMathDisplayMode::Display),
+            CachedMathFormula::new_for_test(Some(svg.clone()), None),
+        );
+        cache.insert(
+            math_contents("y", ParsedMarkdownMathDisplayMode::Inline),
+            CachedMathFormula::new_for_test(Some(mock_render_image()), None),
+        );
+
+        let new_formula = math_contents("x^3", ParsedMarkdownMathDisplayMode::Display);
+        let idx = new_full_order
+            .iter()
+            .position(|contents| contents == &new_formula)
+            .unwrap();
+        let fallback =
+            MathState::get_fallback_image(idx, &old_full_order, new_full_order.len(), &cache);
+
+        assert!(
+            fallback.is_some(),
+            "Should use old formula as fallback when editing"
+        );
+        assert!(
+            Arc::ptr_eq(&fallback.unwrap(), &svg),
+            "Fallback should be the old formula's SVG"
+        );
+    }
+
+    #[test]
+    fn test_render_math_formula_svg() {
+        let svg = render_math_formula_svg(
+            &math_contents("e^{i\\pi} + 1 = 0", ParsedMarkdownMathDisplayMode::Inline),
+            MathRenderStyle {
+                font_size_millipoints: 12000,
+                text_color_rgb: 0xffffff,
+            },
+        )
+        .expect("math should render to SVG");
+
+        assert!(svg.contains("<svg"), "output should be valid SVG");
+    }
+
+    #[test]
+    fn test_render_math_formula_svg_invalid_formula_is_error() {
+        let result = render_math_formula_svg(
+            &math_contents(
+                "}}}{{{\\invalid\\command",
+                ParsedMarkdownMathDisplayMode::Inline,
+            ),
+            MathRenderStyle {
+                font_size_millipoints: 12000,
+                text_color_rgb: 0xffffff,
+            },
+        );
+
+        assert!(result.is_err(), "invalid math should return an error");
     }
 
     #[test]

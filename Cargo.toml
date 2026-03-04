@@ -371,6 +371,7 @@ svg_preview = { path = "crates/svg_preview" }
 media = { path = "crates/media" }
 menu = { path = "crates/menu" }
 mermaid-rs-renderer = { git = "https://github.com/zed-industries/mermaid-rs-renderer", rev = "374db9ead5426697c6c2111151d9f246899bc638", default-features = false }
+mitex = "0.2.4"
 migrator = { path = "crates/migrator" }
 mistral = { path = "crates/mistral" }
 multi_buffer = { path = "crates/multi_buffer" }
@@ -660,6 +661,9 @@ quote = "1.0.9"
 rand = "0.9"
 rayon = "1.8"
 regex = "1.5"
+typst = "0.14.2"
+typst-assets = { version = "0.14.2", features = ["fonts"] }
+typst-svg = "0.14.2"
 # WARNING: If you change this, you must also publish a new version of zed-reqwest to crates.io
 reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662463bda39148ba154100dd44d3fba5873a4", default-features = false, features = [
     "charset",

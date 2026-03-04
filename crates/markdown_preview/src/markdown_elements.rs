@@ -15,6 +15,7 @@ pub enum ParsedMarkdownElement {
     BlockQuote(ParsedMarkdownBlockQuote),
     CodeBlock(ParsedMarkdownCodeBlock),
     MermaidDiagram(ParsedMarkdownMermaidDiagram),
+    DisplayMath(ParsedMarkdownMath),
     /// A paragraph of text and other inline elements.
     Paragraph(MarkdownParagraph),
     HorizontalRule(Range<usize>),
@@ -30,10 +31,16 @@ impl ParsedMarkdownElement {
             Self::BlockQuote(block_quote) => block_quote.source_range.clone(),
             Self::CodeBlock(code_block) => code_block.source_range.clone(),
             Self::MermaidDiagram(mermaid) => mermaid.source_range.clone(),
-            Self::Paragraph(text) => match text.get(0)? {
-                MarkdownParagraphChunk::Text(t) => t.source_range.clone(),
-                MarkdownParagraphChunk::Image(image) => image.source_range.clone(),
-            },
+            Self::DisplayMath(math) => math.source_range.clone(),
+            Self::Paragraph(text) => {
+                let mut ranges = text.iter().map(MarkdownParagraphChunk::source_range);
+                let first_range = ranges.next()?;
+                ranges.fold(first_range, |mut range, chunk_range| {
+                    range.start = range.start.min(chunk_range.start);
+                    range.end = range.end.max(chunk_range.end);
+                    range
+                })
+            }
             Self::HorizontalRule(range) => range.clone(),
             Self::Image(image) => image.source_range.clone(),
         })
@@ -50,7 +57,18 @@ pub type MarkdownParagraph = Vec<MarkdownParagraphChunk>;
 #[cfg_attr(test, derive(PartialEq))]
 pub enum MarkdownParagraphChunk {
     Text(ParsedMarkdownText),
+    InlineMath(ParsedMarkdownMath),
     Image(Image),
+}
+
+impl MarkdownParagraphChunk {
+    pub fn source_range(&self) -> Range<usize> {
+        match self {
+            Self::Text(text) => text.source_range.clone(),
+            Self::InlineMath(math) => math.source_range.clone(),
+            Self::Image(image) => image.source_range.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -107,6 +125,26 @@ pub struct ParsedMarkdownHeading {
     pub source_range: Range<usize>,
     pub level: HeadingLevel,
     pub contents: MarkdownParagraph,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct ParsedMarkdownMath {
+    pub source_range: Range<usize>,
+    pub contents: ParsedMarkdownMathContents,
+    pub link: Option<Link>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ParsedMarkdownMathContents {
+    pub contents: SharedString,
+    pub display_mode: ParsedMarkdownMathDisplayMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParsedMarkdownMathDisplayMode {
+    Inline,
+    Display,
 }
 
 #[derive(Debug, PartialEq)]
