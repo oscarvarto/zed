@@ -10636,6 +10636,7 @@ dependencies = [
  "fs",
  "gpui",
  "html5ever 0.27.0",
+ "image",
  "language",
  "linkify",
  "log",

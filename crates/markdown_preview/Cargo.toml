@@ -22,6 +22,7 @@ comemo.workspace = true
 editor.workspace = true
 fs.workspace = true
 gpui.workspace = true
+image.workspace = true
 html5ever.workspace = true
 language.workspace = true
 linkify.workspace = true

@@ -318,6 +318,9 @@ impl CachedMermaidDiagram {
                     render_mermaid_diagram_image(&contents, renderer_backend, &svg_renderer).await
                 })
                 .await;
+            if let Err(error) = &value {
+                log::error!("mermaid diagram rendering failed: {error:#}");
+            }
             if result_clone.set(value).is_err() {
                 log::error!("mermaid render result was set more than once");
             }
@@ -412,14 +415,22 @@ async fn render_mermaid_diagram_image(
     renderer_backend: MermaidRendererBackend,
     svg_renderer: &gpui::SvgRenderer,
 ) -> anyhow::Result<Arc<RenderImage>> {
-    let svg_bytes = match renderer_backend {
-        MermaidRendererBackend::Rust => {
-            mermaid_rs_renderer::render(&contents.contents)?.into_bytes()
+    match renderer_backend {
+        MermaidRendererBackend::Rust => match mermaid_rs_renderer::render(&contents.contents) {
+            Ok(svg) => render_mermaid_svg(svg_renderer, svg.as_bytes(), contents.scale),
+            Err(rust_error) => {
+                log::warn!(
+                    "Rust mermaid renderer failed, falling back to external mmdc: {rust_error}"
+                );
+                let png_bytes = render_mermaid_with_external_mmdc(contents).await?;
+                render_mermaid_png(&png_bytes, contents.scale)
+            }
+        },
+        MermaidRendererBackend::ExternalMmdc => {
+            let png_bytes = render_mermaid_with_external_mmdc(contents).await?;
+            render_mermaid_png(&png_bytes, contents.scale)
         }
-        MermaidRendererBackend::ExternalMmdc => render_mermaid_with_external_mmdc(contents).await?,
-    };
-
-    render_mermaid_svg(svg_renderer, &svg_bytes, contents.scale)
+    }
 }
 
 fn render_mermaid_svg(
@@ -433,24 +444,59 @@ fn render_mermaid_svg(
         .map_err(|error| anyhow::anyhow!("{}", error))
 }
 
+fn render_mermaid_png(png_bytes: &[u8], scale_percent: u32) -> anyhow::Result<Arc<RenderImage>> {
+    let data =
+        image::load_from_memory_with_format(png_bytes, image::ImageFormat::Png)?.into_rgba8();
+
+    // mmdc renders at --scale 2 for Retina quality. Resize the image to
+    // apply the user's requested scale from ```mermaid <scale>``` syntax.
+    // scale_percent=100 keeps the 2x output as-is (sharp on HiDPI).
+    let mut data = if scale_percent != 100 {
+        let scale = scale_percent as f32 / 100.0;
+        let new_width = (data.width() as f32 * scale).round().max(1.0) as u32;
+        let new_height = (data.height() as f32 * scale).round().max(1.0) as u32;
+        image::imageops::resize(
+            &data,
+            new_width,
+            new_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        data
+    };
+
+    // Convert from RGBA to BGRA to match GPUI's expected pixel format.
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+
+    Ok(Arc::new(RenderImage::new(vec![image::Frame::new(data)])))
+}
+
 async fn render_mermaid_with_external_mmdc(
     contents: &ParsedMarkdownMermaidDiagramContents,
 ) -> anyhow::Result<Vec<u8>> {
     let temporary_directory =
         tempdir().context("failed to create a temporary directory for Mermaid CLI rendering")?;
     let input_path = temporary_directory.path().join("diagram.mmd");
-    let output_path = temporary_directory.path().join("diagram.svg");
+    let output_path = temporary_directory.path().join("diagram.png");
 
     std::fs::write(&input_path, contents.contents.as_ref())
         .with_context(|| format!("failed to write Mermaid source to {}", input_path.display()))?;
 
+    // Use --scale 2 for high-resolution (Retina) output. mmdc's --scale is
+    // a Puppeteer deviceScaleFactor (positive integer), not a percentage.
+    // Display scaling from the ```mermaid <scale>``` syntax is handled via
+    // max_w_full() on the image element.
     let mut command = util::command::new_command("mmdc");
     command
         .kill_on_drop(true)
         .arg("--input")
         .arg(&input_path)
         .arg("--output")
-        .arg(&output_path);
+        .arg(&output_path)
+        .arg("--scale")
+        .arg("2");
 
     let output = command.output().await.context(
         "failed to execute Mermaid CLI renderer `mmdc`; ensure it is installed and available on PATH",
@@ -581,17 +627,20 @@ fn math_typst_page_setup(
     display_mode: ParsedMarkdownMathDisplayMode,
     render_style: MathRenderStyle,
 ) -> String {
-    let margin_points = match display_mode {
-        ParsedMarkdownMathDisplayMode::Inline => 0.0,
-        ParsedMarkdownMathDisplayMode::Display => 4.0,
-    };
-
-    format!(
-        "#set page(width: auto, height: auto, margin: {margin_points:.3}pt, fill: none)\n\
-         #set text(size: {:.3}pt, fill: rgb(\"{}\"))\n",
-        render_style.font_size_points(),
-        render_style.text_color_hex(),
-    )
+    match display_mode {
+        ParsedMarkdownMathDisplayMode::Inline => format!(
+            "#set page(width: auto, height: auto, margin: (x: 2.000pt, top: 3.000pt, bottom: 8.000pt), fill: none)\n\
+             #set text(size: {:.3}pt, fill: rgb(\"{}\"))\n",
+            render_style.font_size_points(),
+            render_style.text_color_hex(),
+        ),
+        ParsedMarkdownMathDisplayMode::Display => format!(
+            "#set page(width: auto, height: auto, margin: 4.000pt, fill: none)\n\
+             #set text(size: {:.3}pt, fill: rgb(\"{}\"))\n",
+            render_style.font_size_points(),
+            render_style.text_color_hex(),
+        ),
+    }
 }
 
 fn math_typst_formula_body(
@@ -1516,7 +1565,7 @@ fn render_inline_markdown(parsed: &MarkdownParagraph, cx: &mut RenderContext) ->
             .flex()
             .flex_row()
             .flex_wrap()
-            .items_baseline()
+            .items_start()
             .into_any_element()
     } else {
         container.into_any_element()
