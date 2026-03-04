@@ -259,10 +259,19 @@ impl MarkdownPreviewView {
     }
 
     fn settings_changed(&mut self, cx: &mut Context<Self>) {
-        if self.mermaid_state.sync_renderer_backend(cx) {
-            if let Some(contents) = self.contents.as_ref() {
+        let mermaid_changed = self.mermaid_state.sync_renderer_backend(cx);
+        let math_changed = self.math_state.sync_settings(cx);
+
+        if let Some(contents) = self.contents.as_ref() {
+            if mermaid_changed {
                 self.mermaid_state.update(contents, cx);
             }
+            if math_changed {
+                self.math_state.update(contents, cx);
+            }
+        }
+
+        if mermaid_changed || math_changed {
             cx.notify();
         }
     }
@@ -564,7 +573,7 @@ impl Render for MarkdownPreviewView {
         let buffer_size = ThemeSettings::get_global(cx).buffer_font_size(cx);
         let buffer_line_height = ThemeSettings::get_global(cx).buffer_line_height;
 
-        if self.math_state.sync_render_style(cx) {
+        if self.math_state.sync_settings(cx) {
             if let Some(contents) = self.contents.as_ref() {
                 self.math_state.update(contents, cx);
             }

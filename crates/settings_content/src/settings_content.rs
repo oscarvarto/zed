@@ -152,6 +152,12 @@ pub struct SettingsContent {
     /// Default: false
     pub use_external_mermaid_mmdc: Option<bool>,
 
+    /// Whether markdown preview should render LaTeX math expressions
+    /// (inline `$...$` and display `$$...$$`) as images.
+    ///
+    /// Default: true
+    pub enable_math_rendering: Option<bool>,
+
     pub repl: Option<ReplSettingsContent>,
 
     /// Whether or not to enable Helix mode.

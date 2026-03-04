@@ -22,7 +22,7 @@ use gpui::{
 use settings::Settings;
 use std::{
     ops::{Mul, Range},
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::catch_unwind,
     sync::{Arc, LazyLock, OnceLock},
     time::Duration,
     vec,
@@ -193,11 +193,22 @@ impl MathRenderStyle {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct MathState {
     cache: MathFormulaCache,
     order: Vec<ParsedMarkdownMathContents>,
     render_style: MathRenderStyle,
+    enabled: bool,
+}
+
+impl Default for MathState {
+    fn default() -> Self {
+        Self {
+            cache: HashMap::default(),
+            order: Vec::new(),
+            render_style: MathRenderStyle::default(),
+            enabled: true,
+        }
+    }
 }
 
 impl MathState {
@@ -233,8 +244,21 @@ impl MathState {
         true
     }
 
-    pub(crate) fn sync_render_style(&mut self, cx: &App) -> bool {
-        self.set_render_style(MathRenderStyle::from_app(cx))
+    pub(crate) fn sync_settings(&mut self, cx: &App) -> bool {
+        let style_changed = self.set_render_style(MathRenderStyle::from_app(cx));
+        let new_enabled = MarkdownPreviewSettings::try_get(cx)
+            .map_or(true, |settings| settings.enable_math_rendering);
+        let enabled_changed = if self.enabled != new_enabled {
+            self.enabled = new_enabled;
+            if !new_enabled {
+                self.cache.clear();
+                self.order.clear();
+            }
+            true
+        } else {
+            false
+        };
+        style_changed || enabled_changed
     }
 
     pub(crate) fn update(
@@ -244,7 +268,11 @@ impl MathState {
     ) {
         use std::collections::HashSet;
 
-        self.sync_render_style(cx);
+        self.sync_settings(cx);
+
+        if !self.enabled {
+            return;
+        }
 
         let mut new_order = Vec::new();
         collect_math_contents(parsed, &mut new_order);
@@ -525,22 +553,25 @@ fn render_math_formula_svg(
     contents: &ParsedMarkdownMathContents,
     render_style: MathRenderStyle,
 ) -> anyhow::Result<String> {
-    catch_unwind(AssertUnwindSafe(|| {
-        render_math_formula_svg_inner(contents, render_style)
-    }))
-    .unwrap_or_else(|_| Err(anyhow::anyhow!("math rendering panicked")))
+    // Extract owned/Copy data so the closure captures only UnwindSafe types
+    // (String, Copy primitives) instead of &SharedString which contains Arc.
+    let formula = contents.contents.to_string();
+    let display_mode = contents.display_mode;
+    catch_unwind(|| render_math_formula_svg_inner(&formula, display_mode, render_style))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("math rendering panicked")))
 }
 
 fn render_math_formula_svg_inner(
-    contents: &ParsedMarkdownMathContents,
+    formula: &str,
+    display_mode: ParsedMarkdownMathDisplayMode,
     render_style: MathRenderStyle,
 ) -> anyhow::Result<String> {
-    let typst_math = mitex::convert_math(contents.contents.as_ref(), None)
+    let typst_math = mitex::convert_math(formula, None)
         .map_err(|error| anyhow::anyhow!("failed to convert LaTeX math with mitex: {error}"))?;
     let typst_source = format!(
-        "{MATH_TYPST_PREAMBLE}{}{formula}",
-        math_typst_page_setup(contents.display_mode, render_style),
-        formula = math_typst_formula_body(contents.display_mode, &typst_math),
+        "#import \"/preamble.typ\": *\n{}{formula_body}",
+        math_typst_page_setup(display_mode, render_style),
+        formula_body = math_typst_formula_body(display_mode, &typst_math),
     );
 
     compile_math_typst_to_svg(&typst_source)
@@ -574,7 +605,16 @@ fn math_typst_formula_body(
 }
 
 fn compile_math_typst_to_svg(source: &str) -> anyhow::Result<String> {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use typst::layout::PagedDocument;
+
+    static COMPILE_COUNT: AtomicU32 = AtomicU32::new(0);
+    if COMPILE_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(50)
+    {
+        comemo::evict(30);
+    }
 
     let world = MathWorld::new(source);
     let warned = typst::compile::<PagedDocument>(&world);
@@ -632,14 +672,23 @@ fn cached_math_library() -> &'static typst::utils::LazyHash<typst::Library> {
     &LIBRARY
 }
 
+fn cached_preamble_source() -> &'static typst::syntax::Source {
+    static PREAMBLE_SOURCE: LazyLock<typst::syntax::Source> = LazyLock::new(|| {
+        let id = typst::syntax::FileId::new(None, typst::syntax::VirtualPath::new("/preamble.typ"));
+        typst::syntax::Source::new(id, MATH_TYPST_PREAMBLE.to_string())
+    });
+    &PREAMBLE_SOURCE
+}
+
 struct MathWorld {
     source: typst::syntax::Source,
 }
 
 impl MathWorld {
     fn new(source_text: &str) -> Self {
+        let id = typst::syntax::FileId::new(None, typst::syntax::VirtualPath::new("/main.typ"));
         Self {
-            source: typst::syntax::Source::detached(source_text),
+            source: typst::syntax::Source::new(id, source_text.to_string()),
         }
     }
 }
@@ -660,6 +709,8 @@ impl typst::World for MathWorld {
     fn source(&self, id: typst::syntax::FileId) -> typst::diag::FileResult<typst::syntax::Source> {
         if id == self.source.id() {
             Ok(self.source.clone())
+        } else if id == cached_preamble_source().id() {
+            Ok(cached_preamble_source().clone())
         } else {
             Err(typst::diag::FileError::AccessDenied)
         }
@@ -1473,6 +1524,18 @@ fn render_inline_markdown(parsed: &MarkdownParagraph, cx: &mut RenderContext) ->
 }
 
 fn render_display_math(parsed: &ParsedMarkdownMath, cx: &mut RenderContext) -> AnyElement {
+    if !cx.math_state.enabled {
+        return cx
+            .with_common_p(div())
+            .py(cx.scaled_rems(0.5))
+            .child(
+                div()
+                    .w_full()
+                    .child(StyledText::new(math_fallback_text(&parsed.contents))),
+            )
+            .into_any_element();
+    }
+
     let cached = cx.math_state.cache.get(&parsed.contents);
     let body =
         if let Some(result) = cached.and_then(|cached_formula| cached_formula.render_image.get()) {
@@ -1665,7 +1728,11 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
             }
 
             MarkdownParagraphChunk::InlineMath(math) => {
-                let math_body = {
+                let math_body = if !cx.math_state.enabled {
+                    div()
+                        .child(StyledText::new(math_fallback_text(&math.contents)))
+                        .into_any_element()
+                } else {
                     let cached = cx.math_state.cache.get(&math.contents);
                     if let Some(result) =
                         cached.and_then(|cached_formula| cached_formula.render_image.get())
@@ -1720,7 +1787,7 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
                             )
                             .into_any_element()
                     }
-                };
+                }; // closes `if !cx.math_state.enabled { ... } else { ... }`
 
                 let workspace = workspace_clone.clone();
                 let element_id = cx.next_id(&math.source_range);
@@ -2142,6 +2209,7 @@ mod tests {
                 font_size_millipoints: 12000,
                 text_color_rgb: 0xffffff,
             },
+            enabled: true,
         };
         state.cache.insert(
             math_contents("x^2", ParsedMarkdownMathDisplayMode::Inline),
@@ -2214,6 +2282,36 @@ mod tests {
         .expect("math should render to SVG");
 
         assert!(svg.contains("<svg"), "output should be valid SVG");
+    }
+
+    #[test]
+    fn test_render_math_formula_svg_multiple_formulas_with_preamble_import() {
+        let render_style = MathRenderStyle {
+            font_size_millipoints: 12000,
+            text_color_rgb: 0xffffff,
+        };
+
+        let svg_inline = render_math_formula_svg(
+            &math_contents("x^2 + y^2 = z^2", ParsedMarkdownMathDisplayMode::Inline),
+            render_style,
+        )
+        .expect("inline formula should render");
+
+        let svg_display = render_math_formula_svg(
+            &math_contents(
+                "\\int_0^\\infty e^{-x} dx = 1",
+                ParsedMarkdownMathDisplayMode::Display,
+            ),
+            render_style,
+        )
+        .expect("display formula should render");
+
+        assert!(svg_inline.contains("<svg"), "inline output should be SVG");
+        assert!(svg_display.contains("<svg"), "display output should be SVG");
+        assert_ne!(
+            svg_inline, svg_display,
+            "different formulas should produce different SVGs"
+        );
     }
 
     #[test]

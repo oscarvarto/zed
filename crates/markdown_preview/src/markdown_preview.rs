@@ -35,12 +35,14 @@ actions!(
 #[derive(Clone, Copy, Debug, Default, RegisterSetting)]
 pub struct MarkdownPreviewSettings {
     pub use_external_mermaid_mmdc: bool,
+    pub enable_math_rendering: bool,
 }
 
 impl Settings for MarkdownPreviewSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         Self {
-            use_external_mermaid_mmdc: content.use_external_mermaid_mmdc.unwrap(),
+            use_external_mermaid_mmdc: content.use_external_mermaid_mmdc.unwrap_or_default(),
+            enable_math_rendering: content.enable_math_rendering.unwrap_or(true),
         }
     }
 }
