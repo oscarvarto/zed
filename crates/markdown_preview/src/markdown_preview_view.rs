@@ -12,7 +12,7 @@ use gpui::{
     Subscription, Task, WeakEntity, Window, list,
 };
 use language::LanguageRegistry;
-use settings::Settings;
+use settings::{Settings, SettingsStore};
 use theme::ThemeSettings;
 use ui::{WithScrollbar, prelude::*};
 use workspace::item::{Item, ItemHandle};
@@ -42,6 +42,7 @@ pub struct MarkdownPreviewView {
     mermaid_state: MermaidState,
     parsing_markdown_task: Option<Task<Result<()>>>,
     mode: MarkdownPreviewMode,
+    _settings_subscription: Subscription,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -219,6 +220,7 @@ impl MarkdownPreviewView {
                 parsing_markdown_task: None,
                 image_cache: RetainAllImageCache::new(cx),
                 mode,
+                _settings_subscription: cx.observe_global::<SettingsStore>(Self::settings_changed),
             };
 
             this.set_editor(active_editor, window, cx);
@@ -251,6 +253,15 @@ impl MarkdownPreviewView {
             && Self::is_markdown_file(&editor, cx)
         {
             self.set_editor(editor, window, cx);
+        }
+    }
+
+    fn settings_changed(&mut self, cx: &mut Context<Self>) {
+        if self.mermaid_state.sync_renderer_backend(cx) {
+            if let Some(contents) = self.contents.as_ref() {
+                self.mermaid_state.update(contents, cx);
+            }
+            cx.notify();
         }
     }
 

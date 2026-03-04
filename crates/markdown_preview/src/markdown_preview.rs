@@ -1,4 +1,5 @@
 use gpui::{App, actions};
+use settings::{RegisterSetting, Settings};
 use workspace::Workspace;
 
 pub mod markdown_elements;
@@ -30,6 +31,19 @@ actions!(
         OpenFollowingPreview
     ]
 );
+
+#[derive(Clone, Copy, Debug, Default, RegisterSetting)]
+pub struct MarkdownPreviewSettings {
+    pub use_external_mermaid_mmdc: bool,
+}
+
+impl Settings for MarkdownPreviewSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        Self {
+            use_external_mermaid_mmdc: content.use_external_mermaid_mmdc.unwrap(),
+        }
+    }
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {

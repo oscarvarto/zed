@@ -144,6 +144,14 @@ pub struct SettingsContent {
     /// The settings for the image viewer.
     pub image_viewer: Option<ImageViewerSettingsContent>,
 
+    /// Whether markdown preview should use the external `mmdc` Mermaid CLI renderer
+    /// instead of the built-in Rust renderer.
+    ///
+    /// Requires `mmdc` to be available on `$PATH`.
+    ///
+    /// Default: false
+    pub use_external_mermaid_mmdc: Option<bool>,
+
     pub repl: Option<ReplSettingsContent>,
 
     /// Whether or not to enable Helix mode.

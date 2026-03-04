@@ -28,7 +28,9 @@ use project::{
 };
 use remote::RemoteClient;
 use serde_json::json;
-use settings::{EnvValue, Settings, SettingsLocation, SettingsStore, initial_server_settings_content};
+use settings::{
+    EnvValue, Settings, SettingsLocation, SettingsStore, initial_server_settings_content,
+};
 use smol::stream::StreamExt;
 use std::{
     path::{Path, PathBuf},

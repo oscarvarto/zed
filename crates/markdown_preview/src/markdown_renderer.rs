@@ -1,4 +1,5 @@
 use crate::{
+    MarkdownPreviewSettings,
     markdown_elements::{
         HeadingLevel, Image, Link, MarkdownParagraph, MarkdownParagraphChunk, ParsedMarkdown,
         ParsedMarkdownBlockQuote, ParsedMarkdownCodeBlock, ParsedMarkdownElement,
@@ -8,6 +9,7 @@ use crate::{
     },
     markdown_preview_view::MarkdownPreviewView,
 };
+use anyhow::Context as _;
 use collections::HashMap;
 use fs::normalize_path;
 use gpui::{
@@ -23,6 +25,7 @@ use std::{
     time::Duration,
     vec,
 };
+use tempfile::tempdir;
 use theme::{ActiveTheme, SyntaxTheme, ThemeSettings};
 use ui::{CopyButton, LinkPreview, ToggleState, prelude::*, tooltip_container};
 use workspace::{OpenOptions, OpenVisible, Workspace};
@@ -46,10 +49,30 @@ type CheckboxClickedCallback = Arc<Box<dyn Fn(&CheckboxClickedEvent, &mut Window
 
 type MermaidDiagramCache = HashMap<ParsedMarkdownMermaidDiagramContents, CachedMermaidDiagram>;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MermaidRendererBackend {
+    #[default]
+    Rust,
+    ExternalMmdc,
+}
+
+impl MermaidRendererBackend {
+    fn from_settings(cx: &App) -> Self {
+        if MarkdownPreviewSettings::try_get(cx)
+            .is_some_and(|settings| settings.use_external_mermaid_mmdc)
+        {
+            Self::ExternalMmdc
+        } else {
+            Self::Rust
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct MermaidState {
     cache: MermaidDiagramCache,
     order: Vec<ParsedMarkdownMermaidDiagramContents>,
+    renderer_backend: MermaidRendererBackend,
 }
 
 impl MermaidState {
@@ -81,6 +104,21 @@ impl MermaidState {
         })
     }
 
+    fn set_renderer_backend(&mut self, renderer_backend: MermaidRendererBackend) -> bool {
+        if self.renderer_backend == renderer_backend {
+            return false;
+        }
+
+        self.cache.clear();
+        self.order.clear();
+        self.renderer_backend = renderer_backend;
+        true
+    }
+
+    pub(crate) fn sync_renderer_backend(&mut self, cx: &App) -> bool {
+        self.set_renderer_backend(MermaidRendererBackend::from_settings(cx))
+    }
+
     pub(crate) fn update(
         &mut self,
         parsed: &ParsedMarkdown,
@@ -88,6 +126,8 @@ impl MermaidState {
     ) {
         use crate::markdown_elements::ParsedMarkdownElement;
         use std::collections::HashSet;
+
+        self.sync_renderer_backend(cx);
 
         let mut new_order = Vec::new();
         for element in parsed.children.iter() {
@@ -102,7 +142,12 @@ impl MermaidState {
                     Self::get_fallback_image(idx, &self.order, new_order.len(), &self.cache);
                 self.cache.insert(
                     new_content.clone(),
-                    CachedMermaidDiagram::new(new_content.clone(), fallback, cx),
+                    CachedMermaidDiagram::new(
+                        new_content.clone(),
+                        fallback,
+                        self.renderer_backend,
+                        cx,
+                    ),
                 );
             }
         }
@@ -121,9 +166,10 @@ pub(crate) struct CachedMermaidDiagram {
 }
 
 impl CachedMermaidDiagram {
-    pub(crate) fn new(
+    fn new(
         contents: ParsedMarkdownMermaidDiagramContents,
         fallback_image: Option<Arc<RenderImage>>,
+        renderer_backend: MermaidRendererBackend,
         cx: &mut Context<MarkdownPreviewView>,
     ) -> Self {
         let result = Arc::new(OnceLock::<anyhow::Result<Arc<RenderImage>>>::new());
@@ -133,14 +179,12 @@ impl CachedMermaidDiagram {
         let _task = cx.spawn(async move |this, cx| {
             let value = cx
                 .background_spawn(async move {
-                    let svg_string = mermaid_rs_renderer::render(&contents.contents)?;
-                    let scale = contents.scale as f32 / 100.0;
-                    svg_renderer
-                        .render_single_frame(svg_string.as_bytes(), scale, true)
-                        .map_err(|e| anyhow::anyhow!("{}", e))
+                    render_mermaid_diagram_image(&contents, renderer_backend, &svg_renderer).await
                 })
                 .await;
-            let _ = result_clone.set(value);
+            if result_clone.set(value).is_err() {
+                log::error!("mermaid render result was set more than once");
+            }
             this.update(cx, |_, cx| {
                 cx.notify();
             })
@@ -161,7 +205,7 @@ impl CachedMermaidDiagram {
     ) -> Self {
         let result = Arc::new(OnceLock::new());
         if let Some(img) = render_image {
-            let _ = result.set(Ok(img));
+            assert!(result.set(Ok(img)).is_ok());
         }
         Self {
             render_image: result,
@@ -170,6 +214,81 @@ impl CachedMermaidDiagram {
         }
     }
 }
+
+async fn render_mermaid_diagram_image(
+    contents: &ParsedMarkdownMermaidDiagramContents,
+    renderer_backend: MermaidRendererBackend,
+    svg_renderer: &gpui::SvgRenderer,
+) -> anyhow::Result<Arc<RenderImage>> {
+    let svg_bytes = match renderer_backend {
+        MermaidRendererBackend::Rust => {
+            mermaid_rs_renderer::render(&contents.contents)?.into_bytes()
+        }
+        MermaidRendererBackend::ExternalMmdc => render_mermaid_with_external_mmdc(contents).await?,
+    };
+
+    render_mermaid_svg(svg_renderer, &svg_bytes, contents.scale)
+}
+
+fn render_mermaid_svg(
+    svg_renderer: &gpui::SvgRenderer,
+    svg_bytes: &[u8],
+    scale_percent: u32,
+) -> anyhow::Result<Arc<RenderImage>> {
+    let scale = scale_percent as f32 / 100.0;
+    svg_renderer
+        .render_single_frame(svg_bytes, scale, true)
+        .map_err(|error| anyhow::anyhow!("{}", error))
+}
+
+async fn render_mermaid_with_external_mmdc(
+    contents: &ParsedMarkdownMermaidDiagramContents,
+) -> anyhow::Result<Vec<u8>> {
+    let temporary_directory =
+        tempdir().context("failed to create a temporary directory for Mermaid CLI rendering")?;
+    let input_path = temporary_directory.path().join("diagram.mmd");
+    let output_path = temporary_directory.path().join("diagram.svg");
+
+    std::fs::write(&input_path, contents.contents.as_ref())
+        .with_context(|| format!("failed to write Mermaid source to {}", input_path.display()))?;
+
+    let mut command = util::command::new_command("mmdc");
+    command
+        .kill_on_drop(true)
+        .arg("--input")
+        .arg(&input_path)
+        .arg("--output")
+        .arg(&output_path);
+
+    let output = command.output().await.context(
+        "failed to execute Mermaid CLI renderer `mmdc`; ensure it is installed and available on PATH",
+    )?;
+
+    if !output.status.success() {
+        let standard_error = String::from_utf8_lossy(&output.stderr);
+        let standard_output = String::from_utf8_lossy(&output.stdout);
+        let diagnostic = match (standard_error.trim(), standard_output.trim()) {
+            ("", "") => String::new(),
+            ("", stdout) => format!(": {stdout}"),
+            (stderr, "") => format!(": {stderr}"),
+            (stderr, stdout) => format!(": {stderr}; stdout: {stdout}"),
+        };
+
+        anyhow::bail!(
+            "Mermaid CLI renderer `mmdc` exited with status {:?}{}",
+            output.status.code(),
+            diagnostic
+        );
+    }
+
+    std::fs::read(&output_path).with_context(|| {
+        format!(
+            "failed to read Mermaid CLI output from {}",
+            output_path.display()
+        )
+    })
+}
+
 #[derive(Clone)]
 pub struct RenderContext<'a> {
     workspace: Option<WeakEntity<Workspace>>,
@@ -1325,6 +1444,23 @@ mod tests {
 
     fn mock_render_image() -> Arc<RenderImage> {
         Arc::new(RenderImage::new(Vec::new()))
+    }
+
+    #[test]
+    fn test_mermaid_cache_is_cleared_when_renderer_backend_changes() {
+        let mut state = MermaidState {
+            cache: HashMap::default(),
+            order: mermaid_sequence(&["graph A"]),
+            renderer_backend: MermaidRendererBackend::Rust,
+        };
+        state.cache.insert(
+            mermaid_contents("graph A"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+
+        assert!(state.set_renderer_backend(MermaidRendererBackend::ExternalMmdc));
+        assert!(state.cache.is_empty());
+        assert!(state.order.is_empty());
     }
 
     #[test]
