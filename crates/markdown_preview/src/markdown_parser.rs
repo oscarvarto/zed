@@ -9,7 +9,7 @@ use html5ever::{ParseOpts, local_name, parse_document, tendril::TendrilSink};
 use language::LanguageRegistry;
 use markdown::parser::PARSE_OPTIONS;
 use markup5ever_rcdom::RcDom;
-use pulldown_cmark::{Alignment, Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use std::{
     cell::RefCell, collections::HashMap, mem, ops::Range, path::PathBuf, rc::Rc, sync::Arc, vec,
 };
@@ -20,7 +20,7 @@ pub async fn parse_markdown(
     file_location_directory: Option<PathBuf>,
     language_registry: Option<Arc<LanguageRegistry>>,
 ) -> ParsedMarkdown {
-    let parser = Parser::new_ext(markdown_input, PARSE_OPTIONS);
+    let parser = Parser::new_ext(markdown_input, PARSE_OPTIONS.union(Options::ENABLE_MATH));
     let parser = MarkdownParser::new(
         parser.into_offset_iter().collect(),
         file_location_directory,
